@@ -1,0 +1,2811 @@
+public class main {
+
+	*.class
+
+	# Log file
+	*.log
+
+	# BlueJ files
+	*.ctxt
+
+	# Mobile Tools for Java (J2ME)
+	.mtj.tmp/
+
+	# Package Files #
+	*.jar
+	*.war
+	*.nar
+	*.ear
+	*.zip
+	*.tar.gz
+	*.rar
+
+	# virtual machine crash logs, see http://www.java.com/en/download/help/error_hotspot.xml
+	hs_err_pid*
+
+	public class main {
+		package org.spigotmc;
+
+		import gnu.trove.set.TByteSet;
+		import gnu.trove.set.hash.TByteHashSet;
+		import net.minecraft.server.Block;
+		import net.minecraft.server.BlockPosition;
+		import net.minecraft.server.Blocks;
+		import net.minecraft.server.World;
+		import org.bukkit.craftbukkit.util.CraftMagicNumbers;
+
+		public class AntiXray
+		{
+
+		    private static final CustomTimingsHandler update = new CustomTimingsHandler( "xray - update" );
+		    private static final CustomTimingsHandler obfuscate = new CustomTimingsHandler( "xray - obfuscate" );
+		    /*========================================================================*/
+		    // Used to keep track of which blocks to obfuscate
+		    private final boolean[] obfuscateBlocks = new boolean[ Short.MAX_VALUE ];
+		    // Used to select a random replacement ore
+		    private final byte[] replacementOres;
+
+		    public AntiXray(SpigotWorldConfig config)
+		    {
+		        // Set all listed blocks as true to be obfuscated
+		        for ( int id : ( config.engineMode == 1 ) ? config.hiddenBlocks : config.replaceBlocks )
+		        {
+		            obfuscateBlocks[id] = true;
+		        }
+
+		        // For every block
+		        TByteSet blocks = new TByteHashSet();
+		        for ( Integer i : config.hiddenBlocks )
+		        {
+		            Block block = Block.getById( i );
+		            // Check it exists and is not a tile entity
+		            if ( block != null && !block.isTileEntity() )
+		            {
+		                // Add it to the set of replacement blocks
+		                blocks.add( (byte) (int) i );
+		            }
+		        }
+		        // Bake it to a flat array of replacements
+		        replacementOres = blocks.toArray();
+		    }
+
+		    /**
+		     * Starts the timings handler, then updates all blocks within the set radius
+		     * of the given coordinate, revealing them if they are hidden ores.
+		     */
+		    public void updateNearbyBlocks(World world, BlockPosition position)
+		    {
+		        if ( world.spigotConfig.antiXray )
+		        {
+		            update.startTiming();
+		            updateNearbyBlocks( world, position, 2, false ); // 2 is the radius, we shouldn't change it as that would make it exponentially slower
+		            update.stopTiming();
+		        }
+		    }
+
+		    /**
+		     * Starts the timings handler, and then removes all non exposed ores from
+		     * the chunk buffer.
+		     */
+		    public void obfuscateSync(int chunkX, int chunkY, int bitmask, byte[] buffer, World world)
+		    {
+		        if ( world.spigotConfig.antiXray )
+		        {
+		            obfuscate.startTiming();
+		            obfuscate( chunkX, chunkY, bitmask, buffer, world );
+		            obfuscate.stopTiming();
+		        }
+		    }
+
+		    /**
+		     * Removes all non exposed ores from the chunk buffer.
+		     */
+		    public void obfuscate(int chunkX, int chunkY, int bitmask, byte[] buffer, World world)
+		    {
+		        // If the world is marked as obfuscated
+		        if ( world.spigotConfig.antiXray )
+		        {
+		            // Initial radius to search around for air
+		            int initialRadius = 1;
+		            // Which block in the buffer we are looking at, anywhere from 0 to 16^4
+		            int index = 0;
+		            // The iterator marking which random ore we should use next
+		            int randomOre = 0;
+
+		            // Chunk corner X and Z blocks
+		            int startX = chunkX << 4;
+		            int startZ = chunkY << 4;
+
+		            byte replaceWithTypeId;
+		            switch ( world.getWorld().getEnvironment() )
+		            {
+		                case NETHER:
+		                    replaceWithTypeId = (byte) CraftMagicNumbers.getId(Blocks.NETHERRACK);
+		                    break;
+		                case THE_END:
+		                    replaceWithTypeId = (byte) CraftMagicNumbers.getId(Blocks.END_STONE);
+		                    break;
+		                default:
+		                    replaceWithTypeId = (byte) CraftMagicNumbers.getId(Blocks.STONE);
+		                    break;
+		            }
+
+		            // Chunks can have up to 16 sections
+		            for ( int i = 0; i < 16; i++ )
+		            {
+		                // If the bitmask indicates this chunk is sent...
+		                if ( ( bitmask & 1 << i ) != 0 )
+		                {
+		                    // Work through all blocks in the chunk, y,z,x
+		                    for ( int y = 0; y < 16; y++ )
+		                    {
+		                        for ( int z = 0; z < 16; z++ )
+		                        {
+		                            for ( int x = 0; x < 16; x++ )
+		                            {
+		                                // For some reason we can get too far ahead of ourselves (concurrent modification on bulk chunks?) so if we do, just abort and move on
+		                                if ( index >= buffer.length )
+		                                {
+		                                    index++;
+		                                    continue;
+		                                }
+		                                // Grab the block ID in the buffer.
+		                                // TODO: extended IDs are not yet supported
+		                                int blockId = (buffer[index << 1] & 0xFF) 
+		                                        | ((buffer[(index << 1) + 1] & 0xFF) << 8);
+		                                blockId >>>= 4;
+		                                // Check if the block should be obfuscated
+		                                if ( obfuscateBlocks[blockId] )
+		                                {
+		                                    // The world isn't loaded, bail out
+		                                    if ( !isLoaded( world, new BlockPosition( startX + x, ( i << 4 ) + y, startZ + z ), initialRadius ) )
+		                                    {
+		                                        index++;
+		                                        continue;
+		                                    }
+		                                    // On the otherhand, if radius is 0, or the nearby blocks are all non air, we can obfuscate
+		                                    if ( !hasTransparentBlockAdjacent( world, new BlockPosition( startX + x, ( i << 4 ) + y, startZ + z ), initialRadius ) )
+		                                    {
+		                                        int newId = blockId;
+		                                        switch ( world.spigotConfig.engineMode )
+		                                        {
+		                                            case 1:
+		                                                // Replace with replacement material
+		                                                newId = replaceWithTypeId & 0xFF;
+		                                                break;
+		                                            case 2:
+		                                                // Replace with random ore.
+		                                                if ( randomOre >= replacementOres.length )
+		                                                {
+		                                                    randomOre = 0;
+		                                                }
+		                                                newId = replacementOres[randomOre++] & 0xFF;
+		                                                break;
+		                                        }
+		                                        newId <<= 4;
+		                                        buffer[index << 1] = (byte) (newId & 0xFF);
+		                                        buffer[(index << 1) + 1] = (byte) ((newId >> 8) & 0xFF);
+		                                    }
+		                                }
+
+		                                index++;
+		                            }
+		                        }
+		                    }
+		                }
+		            }
+		        }
+		    }
+
+		    private void updateNearbyBlocks(World world, BlockPosition position, int radius, boolean updateSelf)
+		    {
+		        // If the block in question is loaded
+		        if ( world.isLoaded( position ) )
+		        {
+		            // Get block id
+		            Block block = world.getType(position).getBlock();
+
+		            // See if it needs update
+		            if ( updateSelf && obfuscateBlocks[Block.getId( block )] )
+		            {
+		                // Send the update
+		                world.notify( position );
+		            }
+
+		            // Check other blocks for updates
+		            if ( radius > 0 )
+		            {
+		                updateNearbyBlocks( world, position.east(), radius - 1, true );
+		                updateNearbyBlocks( world, position.west(), radius - 1, true );
+		                updateNearbyBlocks( world, position.up(), radius - 1, true );
+		                updateNearbyBlocks( world, position.down(), radius - 1, true );
+		                updateNearbyBlocks( world, position.south(), radius - 1, true );
+		                updateNearbyBlocks( world, position.north(), radius - 1, true );
+		            }
+		        }
+		    }
+
+		    private static boolean isLoaded(World world, BlockPosition position, int radius)
+		    {
+		        return world.isLoaded( position )
+		                && ( radius == 0 ||
+		                ( isLoaded( world, position.east(), radius - 1 )
+		                && isLoaded( world, position.west(), radius - 1 )
+		                && isLoaded( world, position.up(), radius - 1 )
+		                && isLoaded( world, position.down(), radius - 1 )
+		                && isLoaded( world, position.south(), radius - 1 )
+		                && isLoaded( world, position.north(), radius - 1 ) ) );
+		    }
+
+		    private static boolean hasTransparentBlockAdjacent(World world, BlockPosition position, int radius)
+		    {
+		        return !isSolidBlock(world.getType(position, false).getBlock()) /* isSolidBlock */
+		                || ( radius > 0
+		                && ( hasTransparentBlockAdjacent( world, position.east(), radius - 1 )
+		                || hasTransparentBlockAdjacent( world, position.west(), radius - 1 )
+		                || hasTransparentBlockAdjacent( world, position.up(), radius - 1 )
+		                || hasTransparentBlockAdjacent( world, position.down(), radius - 1 )
+		                || hasTransparentBlockAdjacent( world, position.south(), radius - 1 )
+		                || hasTransparentBlockAdjacent( world, position.north(), radius - 1 ) ) );
+		    }
+
+		    private static boolean isSolidBlock(Block block) {
+		        // Mob spawners are treated as solid blocks as far as the
+		        // game is concerned for lighting and other tasks but for
+		        // rendering they can be seen through therefor we special
+		        // case them so that the antixray doesn't show the fake
+		        // blocks around them.
+		        return block.isOccluding() && block != Blocks.MOB_SPAWNER;
+		    }
+		}package org.spigotmc;
+
+	import gnu.trove.set.TByteSet;
+	import gnu.trove.set.hash.TByteHashSet;
+	import net.minecraft.server.Block;
+	import net.minecraft.server.BlockPosition;
+	import net.minecraft.server.Blocks;
+	import net.minecraft.server.World;
+	import org.bukkit.craftbukkit.util.CraftMagicNumbers;
+
+	public class AntiXray
+	{
+
+	    private static final CustomTimingsHandler update = new CustomTimingsHandler( "xray - update" );
+	    private static final CustomTimingsHandler obfuscate = new CustomTimingsHandler( "xray - obfuscate" );
+	    /*========================================================================*/
+	    // Used to keep track of which blocks to obfuscate
+	    private final boolean[] obfuscateBlocks = new boolean[ Short.MAX_VALUE ];
+	    // Used to select a random replacement ore
+	    private final byte[] replacementOres;
+
+	    public AntiXray(SpigotWorldConfig config)
+	    {
+	        // Set all listed blocks as true to be obfuscated
+	        for ( int id : ( config.engineMode == 1 ) ? config.hiddenBlocks : config.replaceBlocks )
+	        {
+	            obfuscateBlocks[id] = true;
+	        }
+
+	        // For every block
+	        TByteSet blocks = new TByteHashSet();
+	        for ( Integer i : config.hiddenBlocks )
+	        {
+	            Block block = Block.getById( i );
+	            // Check it exists and is not a tile entity
+	            if ( block != null && !block.isTileEntity() )
+	            {
+	                // Add it to the set of replacement blocks
+	                blocks.add( (byte) (int) i );
+	            }
+	        }
+	        // Bake it to a flat array of replacements
+	        replacementOres = blocks.toArray();
+	    }
+
+	    /**
+	     * Starts the timings handler, then updates all blocks within the set radius
+	     * of the given coordinate, revealing them if they are hidden ores.
+	     */
+	    public void updateNearbyBlocks(World world, BlockPosition position)
+	    {
+	        if ( world.spigotConfig.antiXray )
+	        {
+	            update.startTiming();
+	            updateNearbyBlocks( world, position, 2, false ); // 2 is the radius, we shouldn't change it as that would make it exponentially slower
+	            update.stopTiming();
+	        }
+	    }
+
+	    /**
+	     * Starts the timings handler, and then removes all non exposed ores from
+	     * the chunk buffer.
+	     */
+	    public void obfuscateSync(int chunkX, int chunkY, int bitmask, byte[] buffer, World world)
+	    {
+	        if ( world.spigotConfig.antiXray )
+	        {
+	            obfuscate.startTiming();
+	            obfuscate( chunkX, chunkY, bitmask, buffer, world );
+	            obfuscate.stopTiming();
+	        }
+	    }
+
+	    /**
+	     * Removes all non exposed ores from the chunk buffer.
+	     */
+	    public void obfuscate(int chunkX, int chunkY, int bitmask, byte[] buffer, World world)
+	    {
+	        // If the world is marked as obfuscated
+	        if ( world.spigotConfig.antiXray )
+	        {
+	            // Initial radius to search around for air
+	            int initialRadius = 1;
+	            // Which block in the buffer we are looking at, anywhere from 0 to 16^4
+	            int index = 0;
+	            // The iterator marking which random ore we should use next
+	            int randomOre = 0;
+
+	            // Chunk corner X and Z blocks
+	            int startX = chunkX << 4;
+	            int startZ = chunkY << 4;
+
+	            byte replaceWithTypeId;
+	            switch ( world.getWorld().getEnvironment() )
+	            {
+	                case NETHER:
+	                    replaceWithTypeId = (byte) CraftMagicNumbers.getId(Blocks.NETHERRACK);
+	                    break;
+	                case THE_END:
+	                    replaceWithTypeId = (byte) CraftMagicNumbers.getId(Blocks.END_STONE);
+	                    break;
+	                default:
+	                    replaceWithTypeId = (byte) CraftMagicNumbers.getId(Blocks.STONE);
+	                    break;
+	            }
+
+	            // Chunks can have up to 16 sections
+	            for ( int i = 0; i < 16; i++ )
+	            {
+	                // If the bitmask indicates this chunk is sent...
+	                if ( ( bitmask & 1 << i ) != 0 )
+	                {
+	                    // Work through all blocks in the chunk, y,z,x
+	                    for ( int y = 0; y < 16; y++ )
+	                    {
+	                        for ( int z = 0; z < 16; z++ )
+	                        {
+	                            for ( int x = 0; x < 16; x++ )
+	                            {
+	                                // For some reason we can get too far ahead of ourselves (concurrent modification on bulk chunks?) so if we do, just abort and move on
+	                                if ( index >= buffer.length )
+	                                {
+	                                    index++;
+	                                    continue;
+	                                }
+	                                // Grab the block ID in the buffer.
+	                                // TODO: extended IDs are not yet supported
+	                                int blockId = (buffer[index << 1] & 0xFF) 
+	                                        | ((buffer[(index << 1) + 1] & 0xFF) << 8);
+	                                blockId >>>= 4;
+	                                // Check if the block should be obfuscated
+	                                if ( obfuscateBlocks[blockId] )
+	                                {
+	                                    // The world isn't loaded, bail out
+	                                    if ( !isLoaded( world, new BlockPosition( startX + x, ( i << 4 ) + y, startZ + z ), initialRadius ) )
+	                                    {
+	                                        index++;
+	                                        continue;
+	                                    }
+	                                    // On the otherhand, if radius is 0, or the nearby blocks are all non air, we can obfuscate
+	                                    if ( !hasTransparentBlockAdjacent( world, new BlockPosition( startX + x, ( i << 4 ) + y, startZ + z ), initialRadius ) )
+	                                    {
+	                                        int newId = blockId;
+	                                        switch ( world.spigotConfig.engineMode )
+	                                        {
+	                                            case 1:
+	                                                // Replace with replacement material
+	                                                newId = replaceWithTypeId & 0xFF;
+	                                                break;
+	                                            case 2:
+	                                                // Replace with random ore.
+	                                                if ( randomOre >= replacementOres.length )
+	                                                {
+	                                                    randomOre = 0;
+	                                                }
+	                                                newId = replacementOres[randomOre++] & 0xFF;
+	                                                break;
+	                                        }
+	                                        newId <<= 4;
+	                                        buffer[index << 1] = (byte) (newId & 0xFF);
+	                                        buffer[(index << 1) + 1] = (byte) ((newId >> 8) & 0xFF);
+	                                    }
+	                                }
+
+	                                index++;
+	                            }
+	                        }
+	                    }
+	                }
+	            }
+	        }
+	    }
+
+	    private void updateNearbyBlocks(World world, BlockPosition position, int radius, boolean updateSelf)
+	    {
+	        // If the block in question is loaded
+	        if ( world.isLoaded( position ) )
+	        {
+	            // Get block id
+	            Block block = world.getType(position).getBlock();
+
+	            // See if it needs update
+	            if ( updateSelf && obfuscateBlocks[Block.getId( block )] )
+	            {
+	                // Send the update
+	                world.notify( position );
+	            }
+
+	            // Check other blocks for updates
+	            if ( radius > 0 )
+	            {
+	                updateNearbyBlocks( world, position.east(), radius - 1, true );
+	                updateNearbyBlocks( world, position.west(), radius - 1, true );
+	                updateNearbyBlocks( world, position.up(), radius - 1, true );
+	                updateNearbyBlocks( world, position.down(), radius - 1, true );
+	                updateNearbyBlocks( world, position.south(), radius - 1, true );
+	                updateNearbyBlocks( world, position.north(), radius - 1, true );
+	            }
+	        }
+	    }
+
+	    private static boolean isLoaded(World world, BlockPosition position, int radius)
+	    {
+	        return world.isLoaded( position )
+	                && ( radius == 0 ||
+	                ( isLoaded( world, position.east(), radius - 1 )
+	                && isLoaded( world, position.west(), radius - 1 )
+	                && isLoaded( world, position.up(), radius - 1 )
+	                && isLoaded( world, position.down(), radius - 1 )
+	                && isLoaded( world, position.south(), radius - 1 )
+	                && isLoaded( world, position.north(), radius - 1 ) ) );
+	    }
+
+	    private static boolean hasTransparentBlockAdjacent(World world, BlockPosition position, int radius)
+	    {
+	        return !isSolidBlock(world.getType(position, false).getBlock()) /* isSolidBlock */
+	                || ( radius > 0
+	                && ( hasTransparentBlockAdjacent( world, position.east(), radius - 1 )
+	                || hasTransparentBlockAdjacent( world, position.west(), radius - 1 )
+	                || hasTransparentBlockAdjacent( world, position.up(), radius - 1 )
+	                || hasTransparentBlockAdjacent( world, position.down(), radius - 1 )
+	                || hasTransparentBlockAdjacent( world, position.south(), radius - 1 )
+	                || hasTransparentBlockAdjacent( world, position.north(), radius - 1 ) ) );
+	    }
+
+	    private static boolean isSolidBlock(Block block) {
+	        // Mob spawners are treated as solid blocks as far as the
+	        // game is concerned for lighting and other tasks but for
+	        // rendering they can be seen through therefor we special
+	        // case them so that the antixray doesn't show the fake
+	        // blocks around them.
+	        return block.isOccluding() && block != Blocks.MOB_SPAWNER;
+	    }package org.spigotmc;
+
+	import net.minecraft.server.MinecraftServer;
+
+	public class AsyncCatcher
+	{
+
+	    public static boolean enabled = true;
+
+	    public static void catchOp(String reason)
+	    {
+	        if ( enabled && Thread.currentThread() != MinecraftServer.getServer().primaryThread )
+	        {
+	            throw new IllegalStateException( "Asynchronous " + reason + "!" );
+	        }
+	    }
+	}package org.spigotmc;
+
+	import org.bukkit.command.defaults.TimingsCommand;
+	import org.bukkit.event.HandlerList;
+	import org.bukkit.plugin.Plugin;
+	import org.bukkit.plugin.RegisteredListener;
+	import org.bukkit.plugin.TimedRegisteredListener;
+	import java.io.PrintStream;
+	import java.util.Collection;
+	import java.util.HashSet;
+	import java.util.List;
+	import java.util.Queue;
+	import java.util.concurrent.ConcurrentLinkedQueue;
+
+	import org.bukkit.Bukkit;
+	import org.bukkit.World;
+
+	/**
+	 * Provides custom timing sections for /timings merged.
+	 */
+	public class CustomTimingsHandler
+	{
+
+	    private static Queue<CustomTimingsHandler> HANDLERS = new ConcurrentLinkedQueue<CustomTimingsHandler>();
+	    /*========================================================================*/
+	    private final String name;
+	    private final CustomTimingsHandler parent;
+	    private long count = 0;
+	    private long start = 0;
+	    private long timingDepth = 0;
+	    private long totalTime = 0;
+	    private long curTickTotal = 0;
+	    private long violations = 0;
+
+	    public CustomTimingsHandler(String name)
+	    {
+	        this( name, null );
+	    }
+
+	    public CustomTimingsHandler(String name, CustomTimingsHandler parent)
+	    {
+	        this.name = name;
+	        this.parent = parent;
+	        HANDLERS.add( this );
+	    }
+
+	    /**
+	     * Prints the timings and extra data to the given stream.
+	     *
+	     * @param printStream
+	     */
+	    public static void printTimings(PrintStream printStream)
+	    {
+	        printStream.println( "Minecraft" );
+	        for ( CustomTimingsHandler timings : HANDLERS )
+	        {
+	            long time = timings.totalTime;
+	            long count = timings.count;
+	            if ( count == 0 )
+	            {
+	                continue;
+	            }
+	            long avg = time / count;
+
+	            printStream.println( "    " + timings.name + " Time: " + time + " Count: " + count + " Avg: " + avg + " Violations: " + timings.violations );
+	        }
+	        printStream.println( "# Version " + Bukkit.getVersion() );
+	        int entities = 0;
+	        int livingEntities = 0;
+	        for ( World world : Bukkit.getWorlds() )
+	        {
+	            entities += world.getEntities().size();
+	            livingEntities += world.getLivingEntities().size();
+	        }
+	        printStream.println( "# Entities " + entities );
+	        printStream.println( "# LivingEntities " + livingEntities );
+	    }
+
+	    /**
+	     * Resets all timings.
+	     */
+	    public static void reload()
+	    {
+	        if ( Bukkit.getPluginManager().useTimings() )
+	        {
+	            for ( CustomTimingsHandler timings : HANDLERS )
+	            {
+	                timings.reset();
+	            }
+	        }
+	        TimingsCommand.timingStart = System.nanoTime();
+	    }
+
+	    /**
+	     * Ticked every tick by CraftBukkit to count the number of times a timer
+	     * caused TPS loss.
+	     */
+	    public static void tick()
+	    {
+	        if ( Bukkit.getPluginManager().useTimings() )
+	        {
+	            for ( CustomTimingsHandler timings : HANDLERS )
+	            {
+	                if ( timings.curTickTotal > 50000000 )
+	                {
+	                    timings.violations += Math.ceil( timings.curTickTotal / 50000000 );
+	                }
+	                timings.curTickTotal = 0;
+	                timings.timingDepth = 0; // incase reset messes this up
+	            }
+	        }
+	    }
+
+	    /**
+	     * Starts timing to track a section of code.
+	     */
+	    public void startTiming()
+	    {
+	        // If second condtion fails we are already timing
+	        if ( Bukkit.getPluginManager().useTimings() && ++timingDepth == 1 )
+	        {
+	            start = System.nanoTime();
+	            if ( parent != null && ++parent.timingDepth == 1 )
+	            {
+	                parent.start = start;
+	            }
+	        }
+	    }
+
+	    /**
+	     * Stops timing a section of code.
+	     */
+	    public void stopTiming()
+	    {
+	        if ( Bukkit.getPluginManager().useTimings() )
+	        {
+	            if ( --timingDepth != 0 || start == 0 )
+	            {
+	                return;
+	            }
+	            long diff = System.nanoTime() - start;
+	            totalTime += diff;
+	            curTickTotal += diff;
+	            count++;
+	            start = 0;
+	            if ( parent != null )
+	            {
+	                parent.stopTiming();
+	            }
+	        }
+	    }
+
+	    /**
+	     * Reset this timer, setting all values to zero.
+	     */
+	    public void reset()
+	    {
+	        count = 0;
+	        violations = 0;
+	        curTickTotal = 0;
+	        totalTime = 0;
+	        start = 0;
+	        timingDepth = 0;
+	    }
+	}package org.spigotmc;
+
+	import java.io.FilterInputStream;
+	import java.io.IOException;
+	import java.io.InputStream;
+	import net.minecraft.server.NBTReadLimiter;
+
+	public class LimitStream extends FilterInputStream
+	{
+
+	    private final NBTReadLimiter limit;
+
+	    public LimitStream(InputStream is, NBTReadLimiter limit)
+	    {
+	        super( is );
+	        this.limit = limit;
+	    }
+
+	    @Override
+	    public int read() throws IOException
+	    {
+	        limit.a( 8 );
+	        return super.read();
+	    }
+
+	    @Override
+	    public int read(byte[] b) throws IOException
+	    {
+	        limit.a( b.length * 8 );
+	        return super.read( b );
+	    }
+
+	    @Override
+	    public int read(byte[] b, int off, int len) throws IOException
+	    {
+	        limit.a( len * 8 );
+	        return super.read( b, off, len );
+	    }
+	}Copyright  2018-2020. Finn steenhuyses reserved.
+	*
+	* Redistribution and use in source and binary forms, with or without modification, are
+	* permitted provided that the following conditions are met:
+	*
+	*    1. Redistributions of source code must retain the above copyright notice, this list of
+	*       conditions and the following disclaimer.
+	*
+	*    2. Redistributions in binary form must reproduce the above copyright notice, this list
+	*       of conditions and the following disclaimer in the documentation and/or other materials
+	*       provided with the distribution.
+	*
+	* THIS SOFTWARE IS PROVIDED BY THE AUTHOR ''AS IS'' AND ANY EXPRESS OR IMPLIED
+	* WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+	* FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR
+	* CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+	* CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+	* SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+	* ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+	* NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+	* ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+	*
+	* The views and conclusions contained in the software and documentation are those of the
+	* authors and contributors and should not be interpreted as representing official policies,
+	* either expressed or implied, of anybody else.
+	*/
+	package org.spigotmc;
+
+	import org.bukkit.Bukkit;
+	import org.bukkit.configuration.file.YamlConfiguration;
+	import org.bukkit.configuration.InvalidConfigurationException;
+	import org.bukkit.plugin.Plugin;
+	import org.bukkit.plugin.PluginDescriptionFile;
+	import org.bukkit.scheduler.BukkitTask;
+
+	import java.io.BufferedReader;
+	import java.io.File;
+	import java.io.IOException;
+	import java.io.InputStreamReader;
+	import java.io.OutputStreamWriter;
+	import java.io.UnsupportedEncodingException;
+	import java.net.Proxy;
+	import java.net.URL;
+	import java.net.URLConnection;
+	import java.net.URLEncoder;
+	import java.util.Collections;
+	import java.util.HashSet;
+	import java.util.Iterator;
+	import java.util.LinkedHashSet;
+	import java.util.Set;
+	import java.util.Timer;
+	import java.util.TimerTask;
+	import java.util.UUID;
+	import java.util.concurrent.TimeUnit;
+	import java.util.logging.Level;
+	import net.minecraft.server.MinecraftServer;
+
+	/**
+	* <p> The metrics class obtains data about a plugin and submits statistics about it to the metrics backend. </p> <p>
+	* Public methods provided by this class: </p>
+	* <code>
+	* Graph createGraph(String name); <br/>
+	* void addCustomData(BukkitMetrics.Plotter plotter); <br/>
+	* void start(); <br/>
+	* </code>
+	*/
+	public class Metrics {
+
+	   /**
+	    * The current revision number
+	    */
+	   private final static int REVISION = 6;
+	   /**
+	    * The base url of the metrics domain
+	    */
+	   private static final String BASE_URL = "http://mcstats.org";
+	   /**
+	    * The url used to report a server's status
+	    */
+	   private static final String REPORT_URL = "/report/%s";
+	   /**
+	    * The separator to use for custom data. This MUST NOT change unless you are hosting your own version of metrics and
+	    * want to change it.
+	    */
+	   private static final String CUSTOM_DATA_SEPARATOR = "~~";
+	   /**
+	    * Interval of time to ping (in minutes)
+	    */
+	   private static final int PING_INTERVAL = 10;
+	   /**
+	    * All of the custom graphs to submit to metrics
+	    */
+	   private final Set<Graph> graphs = Collections.synchronizedSet(new HashSet<Graph>());
+	   /**
+	    * The default graph, used for addCustomData when you don't want a specific graph
+	    */
+	   private final Graph defaultGraph = new Graph("Default");
+	   /**
+	    * The plugin configuration file
+	    */
+	   private final YamlConfiguration configuration;
+	   /**
+	    * The plugin configuration file
+	    */
+	   private final File configurationFile;
+	   /**
+	    * Unique server id
+	    */
+	   private final String guid;
+	   /**
+	    * Debug mode
+	    */
+	   private final boolean debug;
+	   /**
+	    * Lock for synchronization
+	    */
+	   private final Object optOutLock = new Object();
+	   /**
+	    * The scheduled task
+	    */
+	   private volatile Timer task = null;
+
+	   public Metrics() throws IOException {
+	       // load the config
+	       configurationFile = getConfigFile();
+	       configuration = YamlConfiguration.loadConfiguration(configurationFile);
+
+	       // add some defaults
+	       configuration.addDefault("opt-out", false);
+	       configuration.addDefault("guid", UUID.randomUUID().toString());
+	       configuration.addDefault("debug", false);
+
+	       // Do we need to create the file?
+	       if (configuration.get("guid", null) == null) {
+	           configuration.options().header("http://mcstats.org").copyDefaults(true);
+	           configuration.save(configurationFile);
+	       }
+
+	       // Load the guid then
+	       guid = configuration.getString("guid");
+	       debug = configuration.getBoolean("debug", false);
+	   }
+
+	   /**
+	    * Construct and create a Graph that can be used to separate specific plotters to their own graphs on the metrics
+	    * website. Plotters can be added to the graph object returned.
+	    *
+	    * @param name The name of the graph
+	    * @return Graph object created. Will never return NULL under normal circumstances unless bad parameters are given
+	    */
+	   public Graph createGraph(final String name) {
+	       if (name == null) {
+	           throw new IllegalArgumentException("Graph name cannot be null");
+	       }
+
+	       // Construct the graph object
+	       final Graph graph = new Graph(name);
+
+	       // Now we can add our graph
+	       graphs.add(graph);
+
+	       // and return back
+	       return graph;
+	   }
+
+	   /**
+	    * Add a Graph object to BukkitMetrics that represents data for the plugin that should be sent to the backend
+	    *
+	    * @param graph The name of the graph
+	    */
+	   public void addGraph(final Graph graph) {
+	       if (graph == null) {
+	           throw new IllegalArgumentException("Graph cannot be null");
+	       }
+
+	       graphs.add(graph);
+	   }
+
+	   /**
+	    * Adds a custom data plotter to the default graph
+	    *
+	    * @param plotter The plotter to use to plot custom data
+	    */
+	   public void addCustomData(final Plotter plotter) {
+	       if (plotter == null) {
+	           throw new IllegalArgumentException("Plotter cannot be null");
+	       }
+
+	       // Add the plotter to the graph o/
+	       defaultGraph.addPlotter(plotter);
+
+	       // Ensure the default graph is included in the submitted graphs
+	       graphs.add(defaultGraph);
+	   }
+
+	   /**
+	    * Start measuring statistics. This will immediately create an async repeating task as the plugin and send the
+	    * initial data to the metrics backend, and then after that it will post in increments of PING_INTERVAL * 1200
+	    * ticks.
+	    *
+	    * @return True if statistics measuring is running, otherwise false.
+	    */
+	   public boolean start() {
+	       synchronized (optOutLock) {
+	           // Did we opt out?
+	           if (isOptOut()) {
+	               return false;
+	           }
+
+	           // Is metrics already running?
+	           if (task != null) {
+	               return true;
+	           }
+
+	           // Begin hitting the server with glorious data
+	           task = new Timer("Spigot Metrics Thread", true);
+
+	           task.scheduleAtFixedRate(new TimerTask() {
+	               private boolean firstPost = true;
+
+	               public void run() {
+	                   try {
+	                       // This has to be synchronized or it can collide with the disable method.
+	                       synchronized (optOutLock) {
+	                           // Disable Task, if it is running and the server owner decided to opt-out
+	                           if (isOptOut() && task != null) {
+	                               task.cancel();
+	                               task = null;
+	                               // Tell all plotters to stop gathering information.
+	                               for (Graph graph : graphs) {
+	                                   graph.onOptOut();
+	                               }
+	                           }
+	                       }
+
+	                       // We use the inverse of firstPost because if it is the first time we are posting,
+	                       // it is not a interval ping, so it evaluates to FALSE
+	                       // Each time thereafter it will evaluate to TRUE, i.e PING!
+	                       postPlugin(!firstPost);
+
+	                       // After the first post we set firstPost to false
+	                       // Each post thereafter will be a ping
+	                       firstPost = false;
+	                   } catch (IOException e) {
+	                       if (debug) {
+	                           Bukkit.getLogger().log(Level.INFO, "[Metrics] " + e.getMessage());
+	                       }
+	                   }
+	               }
+	           }, 0, TimeUnit.MINUTES.toMillis(PING_INTERVAL));
+
+	           return true;
+	       }
+	   }
+
+	   /**
+	    * Has the server owner denied plugin metrics?
+	    *
+	    * @return true if metrics should be opted out of it
+	    */
+	   public boolean isOptOut() {
+	       synchronized (optOutLock) {
+	           try {
+	               // Reload the metrics file
+	               configuration.load(getConfigFile());
+	           } catch (IOException ex) {
+	               if (debug) {
+	                   Bukkit.getLogger().log(Level.INFO, "[Metrics] " + ex.getMessage());
+	               }
+	               return true;
+	           } catch (InvalidConfigurationException ex) {
+	               if (debug) {
+	                   Bukkit.getLogger().log(Level.INFO, "[Metrics] " + ex.getMessage());
+	               }
+	               return true;
+	           }
+	           return configuration.getBoolean("opt-out", false);
+	       }
+	   }
+
+	   /**
+	    * Enables metrics for the server by setting "opt-out" to false in the config file and starting the metrics task.
+	    *
+	    * @throws java.io.IOException
+	    */
+	   public void enable() throws IOException {
+	       // This has to be synchronized or it can collide with the check in the task.
+	       synchronized (optOutLock) {
+	           // Check if the server owner has already set opt-out, if not, set it.
+	           if (isOptOut()) {
+	               configuration.set("opt-out", false);
+	               configuration.save(configurationFile);
+	           }
+
+	           // Enable Task, if it is not running
+	           if (task == null) {
+	               start();
+	           }
+	       }
+	   }
+
+	   /**
+	    * Disables metrics for the server by setting "opt-out" to true in the config file and canceling the metrics task.
+	    *
+	    * @throws java.io.IOException
+	    */
+	   public void disable() throws IOException {
+	       // This has to be synchronized or it can collide with the check in the task.
+	       synchronized (optOutLock) {
+	           // Check if the server owner has already set opt-out, if not, set it.
+	           if (!isOptOut()) {
+	               configuration.set("opt-out", true);
+	               configuration.save(configurationFile);
+	           }
+
+	           // Disable Task, if it is running
+	           if (task != null) {
+	               task.cancel();
+	               task = null;
+	           }
+	       }
+	   }
+
+	   /**
+	    * Gets the File object of the config file that should be used to store data such as the GUID and opt-out status
+	    *
+	    * @return the File object for the config file
+	    */
+	   public File getConfigFile() {
+	       // I believe the easiest way to get the base folder (e.g craftbukkit set via -P) for plugins to use
+	       // is to abuse the plugin object we already have
+	       // plugin.getDataFolder() => base/plugins/PluginA/
+	       // pluginsFolder => base/plugins/
+	       // The base is not necessarily relative to the startup directory.
+	       // File pluginsFolder = plugin.getDataFolder().getParentFile();
+
+	       // return => base/plugins/PluginMetrics/config.yml
+	       return new File(new File((File) MinecraftServer.getServer().options.valueOf("plugins"), "PluginMetrics"), "config.yml");
+	   }
+
+	   /**
+	    * Generic method that posts a plugin to the metrics website
+	    */
+	   private void postPlugin(final boolean isPing) throws IOException {
+	       // Server software specific section
+	       String pluginName = "Spigot";
+	       boolean onlineMode = Bukkit.getServer().getOnlineMode(); // TRUE if online mode is enabled
+	       String pluginVersion = (Metrics.class.getPackage().getImplementationVersion() != null) ? Metrics.class.getPackage().getImplementationVersion() : "unknown";
+	       String serverVersion = Bukkit.getVersion();
+	       int playersOnline = Bukkit.getServer().getOnlinePlayers().size();
+
+	       // END server software specific section -- all code below does not use any code outside of this class / Java
+
+	       // Construct the post data
+	       final StringBuilder data = new StringBuilder();
+
+	       // The plugin's description file containg all of the plugin data such as name, version, author, etc
+	       data.append(encode("guid")).append('=').append(encode(guid));
+	       encodeDataPair(data, "version", pluginVersion);
+	       encodeDataPair(data, "server", serverVersion);
+	       encodeDataPair(data, "players", Integer.toString(playersOnline));
+	       encodeDataPair(data, "revision", String.valueOf(REVISION));
+
+	       // New data as of R6
+	       String osname = System.getProperty("os.name");
+	       String osarch = System.getProperty("os.arch");
+	       String osversion = System.getProperty("os.version");
+	       String java_version = System.getProperty("java.version");
+	       int coreCount = Runtime.getRuntime().availableProcessors();
+
+	       // normalize os arch .. amd64 -> x86_64
+	       if (osarch.equals("amd64")) {
+	           osarch = "x86_64";
+	       }
+
+	       encodeDataPair(data, "osname", osname);
+	       encodeDataPair(data, "osarch", osarch);
+	       encodeDataPair(data, "osversion", osversion);
+	       encodeDataPair(data, "cores", Integer.toString(coreCount));
+	       encodeDataPair(data, "online-mode", Boolean.toString(onlineMode));
+	       encodeDataPair(data, "java_version", java_version);
+
+	       // If we're pinging, append it
+	       if (isPing) {
+	           encodeDataPair(data, "ping", "true");
+	       }
+
+	       // Acquire a lock on the graphs, which lets us make the assumption we also lock everything
+	       // inside of the graph (e.g plotters)
+	       synchronized (graphs) {
+	           final Iterator<Graph> iter = graphs.iterator();
+
+	           while (iter.hasNext()) {
+	               final Graph graph = iter.next();
+
+	               for (Plotter plotter : graph.getPlotters()) {
+	                   // The key name to send to the metrics server
+	                   // The format is C-GRAPHNAME-PLOTTERNAME where separator - is defined at the top
+	                   // Legacy (R4) submitters use the format Custom%s, or CustomPLOTTERNAME
+	                   final String key = String.format("C%s%s%s%s", CUSTOM_DATA_SEPARATOR, graph.getName(), CUSTOM_DATA_SEPARATOR, plotter.getColumnName());
+
+	                   // The value to send, which for the foreseeable future is just the string
+	                   // value of plotter.getValue()
+	                   final String value = Integer.toString(plotter.getValue());
+
+	                   // Add it to the http post data :)
+	                   encodeDataPair(data, key, value);
+	               }
+	           }
+	       }
+
+	       // Create the url
+	       URL url = new URL(BASE_URL + String.format(REPORT_URL, encode(pluginName)));
+
+	       // Connect to the website
+	       URLConnection connection;
+
+	       // Mineshafter creates a socks proxy, so we can safely bypass it
+	       // It does not reroute POST requests so we need to go around it
+	       if (isMineshafterPresent()) {
+	           connection = url.openConnection(Proxy.NO_PROXY);
+	       } else {
+	           connection = url.openConnection();
+	       }
+
+	       connection.setDoOutput(true);
+
+	       // Write the data
+	       final OutputStreamWriter writer = new OutputStreamWriter(connection.getOutputStream());
+	       writer.write(data.toString());
+	       writer.flush();
+
+	       // Now read the response
+	       final BufferedReader reader = new BufferedReader(new InputStreamReader(connection.getInputStream()));
+	       final String response = reader.readLine();
+
+	       // close resources
+	       writer.close();
+	       reader.close();
+
+	       if (response == null || response.startsWith("ERR")) {
+	           throw new IOException(response); //Throw the exception
+	       } else {
+	           // Is this the first update this hour?
+	           if (response.contains("OK This is your first update this hour")) {
+	               synchronized (graphs) {
+	                   final Iterator<Graph> iter = graphs.iterator();
+
+	                   while (iter.hasNext()) {
+	                       final Graph graph = iter.next();
+
+	                       for (Plotter plotter : graph.getPlotters()) {
+	                           plotter.reset();
+	                       }
+	                   }
+	               }
+	           }
+	       }
+	   }
+
+	   /**
+	    * Check if mineshafter is present. If it is, we need to bypass it to send POST requests
+	    *
+	    * @return true if mineshafter is installed on the server
+	    */
+	   private boolean isMineshafterPresent() {
+	       try {
+	           Class.forName("mineshafter.MineServer");
+	           return true;
+	       } catch (Exception e) {
+	           return false;
+	       }
+	   }
+
+	   /**
+	    * <p>Encode a key/value data pair to be used in a HTTP post request. This INCLUDES a & so the first key/value pair
+	    * MUST be included manually, e.g:</p>
+	    * <code>
+	    * StringBuffer data = new StringBuffer();
+	    * data.append(encode("guid")).append('=').append(encode(guid));
+	    * encodeDataPair(data, "version", description.getVersion());
+	    * </code>
+	    *
+	    * @param buffer the stringbuilder to append the data pair onto
+	    * @param key the key value
+	    * @param value the value
+	    */
+	   private static void encodeDataPair(final StringBuilder buffer, final String key, final String value) throws UnsupportedEncodingException {
+	       buffer.append('&').append(encode(key)).append('=').append(encode(value));
+	   }
+
+	   /**
+	    * Encode text as UTF-8
+	    *
+	    * @param text the text to encode
+	    * @return the encoded text, as UTF-8
+	    */
+	   private static String encode(final String text) throws UnsupportedEncodingException {
+	       return URLEncoder.encode(text, "UTF-8");
+	   }
+
+	   /**
+	    * Represents a custom graph on the website
+	    */
+	   public static class Graph {
+
+	       /**
+	        * The graph's name, alphanumeric and spaces only :) If it does not comply to the above when submitted, it is
+	        * rejected
+	        */
+	       private final String name;
+	       /**
+	        * The set of plotters that are contained within this graph
+	        */
+	       private final Set<Plotter> plotters = new LinkedHashSet<Plotter>();
+
+	       private Graph(final String name) {
+	           this.name = name;
+	       }
+
+	       /**
+	        * Gets the graph's name
+	        *
+	        * @return the Graph's name
+	        */
+	       public String getName() {
+	           return name;
+	       }
+
+	       /**
+	        * Add a plotter to the graph, which will be used to plot entries
+	        *
+	        * @param plotter the plotter to add to the graph
+	        */
+	       public void addPlotter(final Plotter plotter) {
+	           plotters.add(plotter);
+	       }
+
+	       /**
+	        * Remove a plotter from the graph
+	        *
+	        * @param plotter the plotter to remove from the graph
+	        */
+	       public void removePlotter(final Plotter plotter) {
+	           plotters.remove(plotter);
+	       }
+
+	       /**
+	        * Gets an <b>unmodifiable</b> set of the plotter objects in the graph
+	        *
+	        * @return an unmodifiable {@link java.util.Set} of the plotter objects
+	        */
+	       public Set<Plotter> getPlotters() {
+	           return Collections.unmodifiableSet(plotters);
+	       }
+
+	       @Override
+	       public int hashCode() {
+	           return name.hashCode();
+	       }
+
+	       @Override
+	       public boolean equals(final Object object) {
+	           if (!(object instanceof Graph)) {
+	               return false;
+	           }
+
+	           final Graph graph = (Graph) object;
+	           return graph.name.equals(name);
+	       }
+
+	       /**
+	        * Called when the server owner decides to opt-out of BukkitMetrics while the server is running.
+	        */
+	       protected void onOptOut() {
+	       }
+	   }
+
+	   /**
+	    * Interface used to collect custom data for a plugin
+	    */
+	   public static abstract class Plotter {
+
+	       /**
+	        * The plot's name
+	        */
+	       private final String name;
+
+	       /**
+	        * Construct a plotter with the default plot name
+	        */
+	       public Plotter() {
+	           this("Default");
+	       }
+
+	       /**
+	        * Construct a plotter with a specific plot name
+	        *
+	        * @param name the name of the plotter to use, which will show up on the website
+	        */
+	       public Plotter(final String name) {
+	           this.name = name;
+	       }
+
+	       /**
+	        * Get the current value for the plotted point. Since this function defers to an external function it may or may
+	        * not return immediately thus cannot be guaranteed to be thread friendly or safe. This function can be called
+	        * from any thread so care should be taken when accessing resources that need to be synchronized.
+	        *
+	        * @return the current value for the point to be plotted.
+	        */
+	       public abstract int getValue();
+
+	       /**
+	        * Get the column name for the plotted point
+	        *
+	        * @return the plotted point's column name
+	        */
+	       public String getColumnName() {
+	           return name;
+	       }
+
+	       /**
+	        * Called after the website graphs have been updated
+	        */
+	       public void reset() {
+	       }
+
+	       @Override
+	       public int hashCode() {
+	           return getColumnName().hashCode();
+	       }
+
+	       @Override
+	       public boolean equals(final Object object) {
+	           if (!(object instanceof Plotter)) {
+	               return false;
+	           }
+
+	           final Plotter plotter = (Plotter) object;
+	           return plotter.name.equals(name) && plotter.getValue() == getValue();
+	       }
+	   }
+	}package org.spigotmc;
+
+	import java.io.File;
+	import java.util.List;
+	import net.minecraft.server.EntityPlayer;
+	import net.minecraft.server.MinecraftServer;
+	import org.bukkit.command.Command;
+	import org.bukkit.command.CommandSender;
+
+	public class RestartCommand extends Command
+	{
+
+	    public RestartCommand(String name)
+	    {
+	        super( name );
+	        this.description = "Restarts the server";
+	        this.usageMessage = "/restart";
+	        this.setPermission( "bukkit.command.restart" );
+	    }
+
+	    @Override
+	    public boolean execute(CommandSender sender, String currentAlias, String[] args)
+	    {
+	        if ( testPermission( sender ) )
+	        {
+	            MinecraftServer.getServer().processQueue.add( new Runnable()
+	            {
+	                @Override
+	                public void run()
+	                {
+	                    restart();
+	                }
+	            } );
+	        }
+	        return true;
+	    }
+
+	    public static void restart()
+	    {
+	        restart( new File( SpigotConfig.restartScript ) );
+	    }
+
+	    public static void restart(final File script)
+	    {
+	        AsyncCatcher.enabled = false; // Disable async catcher incase it interferes with us
+	        try
+	        {
+	            if ( script.isFile() )
+	            {
+	                System.out.println( "Attempting to restart with " + SpigotConfig.restartScript );
+
+	                // Disable Watchdog
+	                WatchdogThread.doStop();
+
+	                // Kick all players
+	                for ( EntityPlayer p : (List< EntityPlayer>) MinecraftServer.getServer().getPlayerList().players )
+	                {
+	                    p.playerConnection.disconnect(SpigotConfig.restartMessage);
+	                }
+	                // Give the socket a chance to send the packets
+	                try
+	                {
+	                    Thread.sleep( 100 );
+	                } catch ( InterruptedException ex )
+	                {
+	                }
+	                // Close the socket so we can rebind with the new process
+	                MinecraftServer.getServer().getServerConnection().b();
+
+	                // Give time for it to kick in
+	                try
+	                {
+	                    Thread.sleep( 100 );
+	                } catch ( InterruptedException ex )
+	                {
+	                }
+
+	                // Actually shutdown
+	                try
+	                {
+	                    MinecraftServer.getServer().stop();
+	                } catch ( Throwable t )
+	                {
+	                }
+
+	                // This will be done AFTER the server has completely halted
+	                Thread shutdownHook = new Thread()
+	                {
+	                    @Override
+	                    public void run()
+	                    {
+	                        try
+	                        {
+	                            String os = System.getProperty( "os.name" ).toLowerCase();
+	                            if ( os.contains( "win" ) )
+	                            {
+	                                Runtime.getRuntime().exec( "cmd /c start " + script.getPath() );
+	                            } else
+	                            {
+	                                Runtime.getRuntime().exec( new String[]
+	                                {
+	                                    "sh", script.getPath()
+	                                } );
+	                            }
+	                        } catch ( Exception e )
+	                        {
+	                            e.printStackTrace();
+	                        }
+	                    }
+	                };
+
+	                shutdownHook.setDaemon( true );
+	                Runtime.getRuntime().addShutdownHook( shutdownHook );
+	            } else
+	            {
+	                System.out.println( "Startup script '" + SpigotConfig.restartScript + "' does not exist! Stopping server." );
+	            }
+	            System.exit( 0 );
+	        } catch ( Exception ex )
+	        {
+	            ex.printStackTrace();
+	        }
+	    }package org.spigotmc;
+
+	public class SneakyThrow
+	{
+
+	    public static void sneaky(Throwable t)
+	    {
+	        throw SneakyThrow.<RuntimeException>superSneaky( t );
+	    }
+
+	    private static <T extends Throwable> T superSneaky(Throwable t) throws T
+	    {
+	        throw (T) t;
+	    }
+	}package org.spigotmc;
+
+	import com.google.common.base.Throwables;
+	import java.io.File;
+	import java.io.IOException;
+	import java.lang.reflect.InvocationTargetException;
+	import java.lang.reflect.Method;
+	import java.lang.reflect.Modifier;
+	import java.util.Arrays;
+	import java.util.HashMap;
+	import java.util.HashSet;
+	import java.util.List;
+	import java.util.Map;
+	import java.util.Set;
+	import java.util.logging.Level;
+	import gnu.trove.map.hash.TObjectIntHashMap;
+	import net.minecraft.server.AttributeRanged;
+	import net.minecraft.server.GenericAttributes;
+	import net.minecraft.server.MinecraftServer;
+	import org.apache.logging.log4j.LogManager;
+	import org.apache.logging.log4j.core.LoggerContext;
+	import org.apache.logging.log4j.core.config.Configuration;
+	import org.bukkit.Bukkit;
+	import org.bukkit.ChatColor;
+	import org.bukkit.command.Command;
+	import org.bukkit.configuration.ConfigurationSection;
+	import org.bukkit.configuration.InvalidConfigurationException;
+	import org.bukkit.configuration.file.YamlConfiguration;
+
+	public class SpigotConfig
+	{
+
+	    private static final File CONFIG_FILE = new File( "spigot.yml" );
+	    private static final String HEADER = "This is the main configuration file for Spigot.\n"
+	            + "As you can see, there's tons to configure. Some options may impact gameplay, so use\n"
+	            + "with caution, and make sure you know what each option does before configuring.\n"
+	            + "For a reference for any variable inside this file, check out the Spigot wiki at\n"
+	            + "http://www.spigotmc.org/wiki/spigot-configuration/\n"
+	            + "\n"
+	            + "If you need help with the configuration or have any questions related to Spigot,\n"
+	            + "join us at the IRC or drop by our forums and leave a post.\n"
+	            + "\n"
+	            + "IRC: #spigot @ irc.spi.gt ( http://www.spigotmc.org/pages/irc/ )\n"
+	            + "Forums: http://www.spigotmc.org/\n";
+	    /*========================================================================*/
+	    public static YamlConfiguration config;
+	    static int version;
+	    static Map<String, Command> commands;
+	    /*========================================================================*/
+	    private static Metrics metrics;
+
+	    public static void init()
+	    {
+	        config = new YamlConfiguration();
+	        try
+	        {
+	            config.load( CONFIG_FILE );
+	        } catch ( IOException ex )
+	        {
+	        } catch ( InvalidConfigurationException ex )
+	        {
+	            Bukkit.getLogger().log( Level.SEVERE, "Could not load spigot.yml, please correct your syntax errors", ex );
+	            throw Throwables.propagate( ex );
+	        }
+
+	        config.options().header( HEADER );
+	        config.options().copyDefaults( true );
+
+	        commands = new HashMap<String, Command>();
+
+	        version = getInt( "config-version", 8 );
+	        set( "config-version", 8 );
+	        readConfig( SpigotConfig.class, null );
+	    }
+
+	    public static void registerCommands()
+	    {
+	        for ( Map.Entry<String, Command> entry : commands.entrySet() )
+	        {
+	            MinecraftServer.getServer().server.getCommandMap().register( entry.getKey(), "Spigot", entry.getValue() );
+	        }
+
+	        if ( metrics == null )
+	        {
+	            try
+	            {
+	                metrics = new Metrics();
+	                metrics.start();
+	            } catch ( IOException ex )
+	            {
+	                Bukkit.getServer().getLogger().log( Level.SEVERE, "Could not start metrics service", ex );
+	            }
+	        }
+	    }
+
+	    static void readConfig(Class<?> clazz, Object instance)
+	    {
+	        for ( Method method : clazz.getDeclaredMethods() )
+	        {
+	            if ( Modifier.isPrivate( method.getModifiers() ) )
+	            {
+	                if ( method.getParameterTypes().length == 0 && method.getReturnType() == Void.TYPE )
+	                {
+	                    try
+	                    {
+	                        method.setAccessible( true );
+	                        method.invoke( instance );
+	                    } catch ( InvocationTargetException ex )
+	                    {
+	                        throw Throwables.propagate( ex.getCause() );
+	                    } catch ( Exception ex )
+	                    {
+	                        Bukkit.getLogger().log( Level.SEVERE, "Error invoking " + method, ex );
+	                    }
+	                }
+	            }
+	        }
+
+	        try
+	        {
+	            config.save( CONFIG_FILE );
+	        } catch ( IOException ex )
+	        {
+	            Bukkit.getLogger().log( Level.SEVERE, "Could not save " + CONFIG_FILE, ex );
+	        }
+	    }
+
+	    private static void set(String path, Object val)
+	    {
+	        config.set( path, val );
+	    }
+
+	    private static boolean getBoolean(String path, boolean def)
+	    {
+	        config.addDefault( path, def );
+	        return config.getBoolean( path, config.getBoolean( path ) );
+	    }
+
+	    private static int getInt(String path, int def)
+	    {
+	        config.addDefault( path, def );
+	        return config.getInt( path, config.getInt( path ) );
+	    }
+
+	    private static <T> List getList(String path, T def)
+	    {
+	        config.addDefault( path, def );
+	        return (List<T>) config.getList( path, config.getList( path ) );
+	    }
+
+	    private static String getString(String path, String def)
+	    {
+	        config.addDefault( path, def );
+	        return config.getString( path, config.getString( path ) );
+	    }
+
+	    private static double getDouble(String path, double def)
+	    {
+	        config.addDefault( path, def );
+	        return config.getDouble( path, config.getDouble( path ) );
+	    }
+
+	    public static boolean logCommands;
+	    private static void logCommands()
+	    {
+	        logCommands = getBoolean( "commands.log", true );
+	    }
+
+	    public static int tabComplete;
+	    private static void tabComplete()
+	    {
+	        if ( version < 6 )
+	        {
+	            boolean oldValue = getBoolean( "commands.tab-complete", true );
+	            if ( oldValue )
+	            {
+	                set( "commands.tab-complete", 0 );
+	            } else
+	            {
+	                set( "commands.tab-complete", -1 );
+	            }
+	        }
+	        tabComplete = getInt( "commands.tab-complete", 0 );
+	    }
+
+	    public static String whitelistMessage;
+	    public static String unknownCommandMessage;
+	    public static String serverFullMessage;
+	    public static String outdatedClientMessage = "Outdated client! Please use {0}";
+	    public static String outdatedServerMessage = "Outdated server! I\'m still on {0}";
+	    private static String transform(String s)
+	    {
+	        return ChatColor.translateAlternateColorCodes( '&', s ).replaceAll( "\\n", "\n" );
+	    }
+	    private static void messages()
+	    {
+	        if (version < 8)
+	        {
+	            set( "messages.outdated-client", outdatedClientMessage );
+	            set( "messages.outdated-server", outdatedServerMessage );
+	        }
+
+	        whitelistMessage = transform( getString( "messages.whitelist", "You are not whitelisted on this server!" ) );
+	        unknownCommandMessage = transform( getString( "messages.unknown-command", "Unknown command. Type \"/help\" for help." ) );
+	        serverFullMessage = transform( getString( "messages.server-full", "The server is full!" ) );
+	        outdatedClientMessage = transform( getString( "messages.outdated-client", outdatedClientMessage ) );
+	        outdatedServerMessage = transform( getString( "messages.outdated-server", outdatedServerMessage ) );
+	    }
+
+	    public static int timeoutTime = 60;
+	    public static boolean restartOnCrash = true;
+	    public static String restartScript = "./start.sh";
+	    public static String restartMessage;
+	    private static void watchdog()
+	    {
+	        timeoutTime = getInt( "settings.timeout-time", timeoutTime );
+	        restartOnCrash = getBoolean( "settings.restart-on-crash", restartOnCrash );
+	        restartScript = getString( "settings.restart-script", restartScript );
+	        restartMessage = transform( getString( "messages.restart", "Server is restarting" ) );
+	        commands.put( "restart", new RestartCommand( "restart" ) );
+	        WatchdogThread.doStart( timeoutTime, restartOnCrash );
+	    }
+
+	    public static boolean bungee;
+	    private static void bungee() {
+	        if ( version < 4 )
+	        {
+	            set( "settings.bungeecord", false );
+	            System.out.println( "Oudated config, disabling BungeeCord support!" );
+	        }
+	        bungee = getBoolean( "settings.bungeecord", false );
+	    }
+
+	    private static void nettyThreads()
+	    {
+	        int count = getInt( "settings.netty-threads", 4 );
+	        System.setProperty( "io.netty.eventLoopThreads", Integer.toString( count ) );
+	        Bukkit.getLogger().log( Level.INFO, "Using {0} threads for Netty based IO", count );
+	    }
+
+	    public static boolean lateBind;
+	    private static void lateBind() {
+	        lateBind = getBoolean( "settings.late-bind", false );
+	    }
+
+	    public static boolean disableStatSaving;
+	    public static TObjectIntHashMap<String> forcedStats = new TObjectIntHashMap<String>();
+	    private static void stats()
+	    {
+	        disableStatSaving = getBoolean( "stats.disable-saving", false );
+
+	        if ( !config.contains( "stats.forced-stats" ) ) {
+	            config.createSection( "stats.forced-stats" );
+	        }
+
+	        ConfigurationSection section = config.getConfigurationSection( "stats.forced-stats" );
+	        for ( String name : section.getKeys( true ) )
+	        {
+	            if ( section.isInt( name ) )
+	            {
+	                forcedStats.put( name, section.getInt( name ) );
+	            }
+	        }
+
+	        if ( disableStatSaving && section.getInt( "achievement.openInventory", 0 ) < 1 )
+	        {
+	            Bukkit.getLogger().warning( "*** WARNING *** stats.disable-saving is true but stats.forced-stats.achievement.openInventory" +
+	                    " isn't set to 1. Disabling stat saving without forcing the achievement may cause it to get stuck on the player's " +
+	                    "screen." );
+	        }
+	    }
+
+	    private static void tpsCommand()
+	    {
+	        commands.put( "tps", new TicksPerSecondCommand( "tps" ) );
+	    }
+
+	    public static int playerSample;
+	    private static void playerSample()
+	    {
+	        playerSample = getInt( "settings.sample-count", 12 );
+	        System.out.println( "Server Ping Player Sample Count: " + playerSample );
+	    }
+
+	    public static int playerShuffle;
+	    private static void playerShuffle()
+	    {
+	        playerShuffle = getInt( "settings.player-shuffle", 0 );
+	    }
+
+	    public static List<String> spamExclusions;
+	    private static void spamExclusions()
+	    {
+	        spamExclusions = getList( "commands.spam-exclusions", Arrays.asList( new String[]
+	        {
+	                "/skill"
+	        } ) );
+	    }
+
+	    public static boolean silentCommandBlocks;
+	    private static void silentCommandBlocks()
+	    {
+	        silentCommandBlocks = getBoolean( "commands.silent-commandblock-console", false );
+	    }
+
+	    public static boolean filterCreativeItems;
+	    private static void filterCreativeItems()
+	    {
+	        filterCreativeItems = getBoolean( "settings.filter-creative-items", true );
+	    }
+
+	    public static Set<String> replaceCommands;
+	    private static void replaceCommands()
+	    {
+	        if ( config.contains( "replace-commands" ) )
+	        {
+	            set( "commands.replace-commands", config.getStringList( "replace-commands" ) );
+	            config.set( "replace-commands", null );
+	        }
+	        replaceCommands = new HashSet<String>( (List<String>) getList( "commands.replace-commands",
+	                Arrays.asList( "setblock", "summon", "testforblock", "tellraw" ) ) );
+	    }
+	    
+	    public static int userCacheCap;
+	    private static void userCacheCap()
+	    {
+	        userCacheCap = getInt( "settings.user-cache-size", 1000 );
+	    }
+	    
+	    public static boolean saveUserCacheOnStopOnly;
+	    private static void saveUserCacheOnStopOnly()
+	    {
+	        saveUserCacheOnStopOnly = getBoolean( "settings.save-user-cache-on-stop-only", false );
+	    }
+
+	    public static int intCacheLimit;
+	    private static void intCacheLimit()
+	    {
+	        intCacheLimit = getInt( "settings.int-cache-limit", 1024 );
+	    }
+
+	    public static double movedWronglyThreshold;
+	    private static void movedWronglyThreshold()
+	    {
+	        movedWronglyThreshold = getDouble( "settings.moved-wrongly-threshold", 0.0625D );
+	    }
+
+	    public static double movedTooQuicklyThreshold;
+	    private static void movedTooQuicklyThreshold()
+	    {
+	        movedTooQuicklyThreshold = getDouble( "settings.moved-too-quickly-threshold", 100.0D );
+	    }
+
+	    public static double maxHealth = 2048;
+	    public static double movementSpeed = 2048;
+	    public static double attackDamage = 2048;
+	    private static void attributeMaxes()
+	    {
+	        maxHealth = getDouble( "settings.attribute.maxHealth.max", maxHealth );
+	        ( (AttributeRanged) GenericAttributes.maxHealth ).b = maxHealth;
+	        movementSpeed = getDouble( "settings.attribute.movementSpeed.max", movementSpeed );
+	        ( (AttributeRanged) GenericAttributes.MOVEMENT_SPEED ).b = movementSpeed;
+	        attackDamage = getDouble( "settings.attribute.attackDamage.max", attackDamage );
+	        ( (AttributeRanged) GenericAttributes.ATTACK_DAMAGE ).b = attackDamage;
+	    }
+
+	    public static boolean debug;
+	    private static void debug()
+	    {
+	        debug = getBoolean( "settings.debug", false );
+
+	        if ( debug && !LogManager.getRootLogger().isTraceEnabled() )
+	        {
+	            // Enable debug logging
+	            LoggerContext ctx = (LoggerContext) LogManager.getContext( false );
+	            Configuration conf = ctx.getConfiguration();
+	            conf.getLoggerConfig( LogManager.ROOT_LOGGER_NAME ).setLevel( org.apache.logging.log4j.Level.ALL );
+	            ctx.updateLoggers( conf );
+	        }
+
+	        if ( LogManager.getRootLogger().isTraceEnabled() )
+	        {
+	            Bukkit.getLogger().info( "Debug logging is enabled" );
+	        } else
+	        {
+	            Bukkit.getLogger().info( "Debug logging is disabled" );
+	        }
+	    }package org.spigotmc;
+
+	import java.util.Arrays;
+	import java.util.List;
+	import org.bukkit.Bukkit;
+	import org.bukkit.configuration.file.YamlConfiguration;
+
+	public class SpigotWorldConfig
+	{
+
+	    private final String worldName;
+	    private final YamlConfiguration config;
+	    private boolean verbose;
+
+	    public SpigotWorldConfig(String worldName)
+	    {
+	        this.worldName = worldName;
+	        this.config = SpigotConfig.config;
+	        init();
+	    }
+
+	    public void init()
+	    {
+	        this.verbose = getBoolean( "verbose", true );
+
+	        log( "-------- World Settings For [" + worldName + "] --------" );
+	        SpigotConfig.readConfig( SpigotWorldConfig.class, this );
+	    }
+
+	    private void log(String s)
+	    {
+	        if ( verbose )
+	        {
+	            Bukkit.getLogger().info( s );
+	        }
+	    }
+
+	    private void set(String path, Object val)
+	    {
+	        config.set( "world-settings.default." + path, val );
+	    }
+
+	    private boolean getBoolean(String path, boolean def)
+	    {
+	        config.addDefault( "world-settings.default." + path, def );
+	        return config.getBoolean( "world-settings." + worldName + "." + path, config.getBoolean( "world-settings.default." + path ) );
+	    }
+
+	    private double getDouble(String path, double def)
+	    {
+	        config.addDefault( "world-settings.default." + path, def );
+	        return config.getDouble( "world-settings." + worldName + "." + path, config.getDouble( "world-settings.default." + path ) );
+	    }
+
+	    private int getInt(String path, int def)
+	    {
+	        config.addDefault( "world-settings.default." + path, def );
+	        return config.getInt( "world-settings." + worldName + "." + path, config.getInt( "world-settings.default." + path ) );
+	    }
+
+	    private <T> List getList(String path, T def)
+	    {
+	        config.addDefault( "world-settings.default." + path, def );
+	        return (List<T>) config.getList( "world-settings." + worldName + "." + path, config.getList( "world-settings.default." + path ) );
+	    }
+
+	    private String getString(String path, String def)
+	    {
+	        config.addDefault( "world-settings.default." + path, def );
+	        return config.getString( "world-settings." + worldName + "." + path, config.getString( "world-settings.default." + path ) );
+	    }
+
+	    public int chunksPerTick;
+	    public boolean clearChunksOnTick;
+	    private void chunksPerTick()
+	    {
+	        chunksPerTick = getInt( "chunks-per-tick", 650 );
+	        log( "Chunks to Grow per Tick: " + chunksPerTick );
+
+	        clearChunksOnTick = getBoolean( "clear-tick-list", false );
+	        log( "Clear tick list: " + clearChunksOnTick );
+	    }
+
+	    // Crop growth rates
+	    public int cactusModifier;
+	    public int caneModifier;
+	    public int melonModifier;
+	    public int mushroomModifier;
+	    public int pumpkinModifier;
+	    public int saplingModifier;
+	    public int wheatModifier;
+	    private int getAndValidateGrowth(String crop)
+	    {
+	        int modifier = getInt( "growth." + crop.toLowerCase() + "-modifier", 100 );
+	        if ( modifier == 0 )
+	        {
+	            log( "Cannot set " + crop + " growth to zero, defaulting to 100" );
+	            modifier = 100;
+	        }
+	        log( crop + " Growth Modifier: " + modifier + "%" );
+
+	        return modifier;
+	    }
+	    private void growthModifiers()
+	    {
+	        cactusModifier = getAndValidateGrowth( "Cactus" );
+	        caneModifier = getAndValidateGrowth( "Cane" );
+	        melonModifier = getAndValidateGrowth( "Melon" );
+	        mushroomModifier = getAndValidateGrowth( "Mushroom" );
+	        pumpkinModifier = getAndValidateGrowth( "Pumpkin" );
+	        saplingModifier = getAndValidateGrowth( "Sapling" );
+	        wheatModifier = getAndValidateGrowth( "Wheat" );
+	    }
+
+	    public double itemMerge;
+	    private void itemMerge()
+	    {
+	        itemMerge = getDouble("merge-radius.item", 2.5 );
+	        log( "Item Merge Radius: " + itemMerge );
+	    }
+
+	    public double expMerge;
+	    private void expMerge()
+	    {
+	        expMerge = getDouble("merge-radius.exp", 3.0 );
+	        log( "Experience Merge Radius: " + expMerge );
+	    }
+
+	    public int viewDistance;
+	    private void viewDistance()
+	    {
+	        viewDistance = getInt( "view-distance", Bukkit.getViewDistance() );
+	        log( "View Distance: " + viewDistance );
+	    }
+
+	    public byte mobSpawnRange;
+	    private void mobSpawnRange()
+	    {
+	        mobSpawnRange = (byte) getInt( "mob-spawn-range", 4 );
+	        log( "Mob Spawn Range: " + mobSpawnRange );
+	    }
+
+	    public int animalActivationRange = 32;
+	    public int monsterActivationRange = 32;
+	    public int miscActivationRange = 16;
+	    private void activationRange()
+	    {
+	        animalActivationRange = getInt( "entity-activation-range.animals", animalActivationRange );
+	        monsterActivationRange = getInt( "entity-activation-range.monsters", monsterActivationRange );
+	        miscActivationRange = getInt( "entity-activation-range.misc", miscActivationRange );
+	        log( "Entity Activation Range: An " + animalActivationRange + " / Mo " + monsterActivationRange + " / Mi " + miscActivationRange );
+	    }
+
+	    public int playerTrackingRange = 48;
+	    public int animalTrackingRange = 48;
+	    public int monsterTrackingRange = 48;
+	    public int miscTrackingRange = 32;
+	    public int otherTrackingRange = 64;
+	    private void trackingRange()
+	    {
+	        playerTrackingRange = getInt( "entity-tracking-range.players", playerTrackingRange );
+	        animalTrackingRange = getInt( "entity-tracking-range.animals", animalTrackingRange );
+	        monsterTrackingRange = getInt( "entity-tracking-range.monsters", monsterTrackingRange );
+	        miscTrackingRange = getInt( "entity-tracking-range.misc", miscTrackingRange );
+	        otherTrackingRange = getInt( "entity-tracking-range.other", otherTrackingRange );
+	        log( "Entity Tracking Range: Pl " + playerTrackingRange + " / An " + animalTrackingRange + " / Mo " + monsterTrackingRange + " / Mi " + miscTrackingRange + " / Other " + otherTrackingRange );
+	    }
+
+	    public int hopperTransfer;
+	    public int hopperCheck;
+	    public int hopperAmount;
+	    private void hoppers()
+	    {
+	        // Set the tick delay between hopper item movements
+	        hopperTransfer = getInt( "ticks-per.hopper-transfer", 8 );
+	        // Set the tick delay between checking for items after the associated
+	        // container is empty. Default to the hopperTransfer value to prevent
+	        // hopper sorting machines from becoming out of sync.
+	        hopperCheck = getInt( "ticks-per.hopper-check", hopperTransfer );
+	        hopperAmount = getInt( "hopper-amount", 1 );
+	        log( "Hopper Transfer: " + hopperTransfer + " Hopper Check: " + hopperCheck + " Hopper Amount: " + hopperAmount );
+	    }
+
+	    public boolean randomLightUpdates;
+	    private void lightUpdates()
+	    {
+	        randomLightUpdates = getBoolean( "random-light-updates", false );
+	        log( "Random Lighting Updates: " + randomLightUpdates );
+	    }
+
+	    public boolean saveStructureInfo;
+	    private void structureInfo()
+	    {
+	        saveStructureInfo = getBoolean( "save-structure-info", true );
+	        log( "Structure Info Saving: " + saveStructureInfo );
+	        if ( !saveStructureInfo )
+	        {
+	            log( "*** WARNING *** You have selected to NOT save structure info. This may cause structures such as fortresses to not spawn mobs!" );
+	            log( "*** WARNING *** Please use this option with caution, SpigotMC is not responsible for any issues this option may cause in the future!" );
+	        }
+	    }
+
+	    public int itemDespawnRate;
+	    private void itemDespawnRate()
+	    {
+	        itemDespawnRate = getInt( "item-despawn-rate", 6000 );
+	        log( "Item Despawn Rate: " + itemDespawnRate );
+	    }
+
+	    public int arrowDespawnRate;
+	    private void arrowDespawnRate()
+	    {
+	        arrowDespawnRate = getInt( "arrow-despawn-rate", 1200  );
+	        log( "Arrow Despawn Rate: " + arrowDespawnRate );
+	    }
+	    
+	    public boolean antiXray;
+	    public int engineMode;
+	    public List<Integer> hiddenBlocks;
+	    public List<Integer> replaceBlocks;
+	    public AntiXray antiXrayInstance;
+	    private void antiXray()
+	    {
+	        antiXray = getBoolean( "anti-xray.enabled", true );
+	        log( "Anti X-Ray: " + antiXray );
+
+	        engineMode = getInt( "anti-xray.engine-mode", 1 );
+	        log( "\tEngine Mode: " + engineMode );
+
+	        if ( SpigotConfig.version < 5 )
+	        {
+	            set( "anti-xray.blocks", null );
+	        }
+	        hiddenBlocks = getList( "anti-xray.hide-blocks", Arrays.asList( new Integer[]
+	        {
+	            14, 15, 16, 21, 48, 49, 54, 56, 73, 74, 82, 129, 130
+	        } ) );
+	        log( "\tHidden Blocks: " + hiddenBlocks );
+
+	        replaceBlocks = getList( "anti-xray.replace-blocks", Arrays.asList( new Integer[]
+	        {
+	            1, 5
+	        } ) );
+	        log( "\tReplace Blocks: " + replaceBlocks );
+
+	        antiXrayInstance = new AntiXray( this );
+	    }
+
+	    public boolean zombieAggressiveTowardsVillager;
+	    private void zombieAggressiveTowardsVillager()
+	    {
+	        zombieAggressiveTowardsVillager = getBoolean( "zombie-aggressive-towards-villager", true );
+	        log( "Zombie Aggressive Towards Villager: " + zombieAggressiveTowardsVillager );
+	    }
+
+	    public boolean nerfSpawnerMobs;
+	    private void nerfSpawnerMobs()
+	    {
+	        nerfSpawnerMobs = getBoolean( "nerf-spawner-mobs", false );
+	        log( "Nerfing mobs spawned from spawners: " + nerfSpawnerMobs );
+	    }
+
+	    public boolean enableZombiePigmenPortalSpawns;
+	    private void enableZombiePigmenPortalSpawns()
+	    {
+	        enableZombiePigmenPortalSpawns = getBoolean( "enable-zombie-pigmen-portal-spawns", true );
+	        log( "Allow Zombie Pigmen to spawn from portal blocks: " + enableZombiePigmenPortalSpawns );
+	    }
+
+	    public int maxBulkChunk;
+	    private void bulkChunkCount()
+	    {
+	        maxBulkChunk = getInt( "max-bulk-chunks", 10 );
+	        log( "Sending up to " + maxBulkChunk + " chunks per packet" );
+	    }
+
+	    public int maxCollisionsPerEntity;
+	    private void maxEntityCollision()
+	    {
+	        maxCollisionsPerEntity = getInt( "max-entity-collisions", 8 );
+	        log( "Max Entity Collisions: " + maxCollisionsPerEntity );
+	    }
+
+	    public int dragonDeathSoundRadius;
+	    private void keepDragonDeathPerWorld()
+	    {
+	        dragonDeathSoundRadius = getInt( "dragon-death-sound-radius", 0 );
+	    }
+
+	    public int witherSpawnSoundRadius;
+	    private void witherSpawnSoundRadius()
+	    {
+	        witherSpawnSoundRadius = getInt( "wither-spawn-sound-radius", 0 );
+	    }
+
+	    public int villageSeed;
+	    public int largeFeatureSeed;
+	    private void initWorldGenSeeds()
+	    {
+	        villageSeed = getInt( "seed-village", 10387312 );
+	        largeFeatureSeed = getInt( "seed-feature", 14357617 );
+	        log( "Custom Map Seeds:  Village: " + villageSeed + " Feature: " + largeFeatureSeed );
+	    }
+
+	    public float walkExhaustion;
+	    public float sprintExhaustion;
+	    public float combatExhaustion;
+	    public float regenExhaustion;
+	    private void initHunger()
+	    {
+	        walkExhaustion = (float) getDouble( "hunger.walk-exhaustion", 0.2 );
+	        sprintExhaustion = (float) getDouble( "hunger.sprint-exhaustion", 0.8 );
+	        combatExhaustion = (float) getDouble( "hunger.combat-exhaustion", 0.3 );
+	        regenExhaustion = (float) getDouble( "hunger.regen-exhaustion", 3 );
+	    }
+
+	    public int currentPrimedTnt = 0;
+	    public int maxTntTicksPerTick;
+	    private void maxTntPerTick() {
+	        if ( SpigotConfig.version < 7 )
+	        {
+	            set( "max-tnt-per-tick", 100 );
+	        }
+	        maxTntTicksPerTick = getInt( "max-tnt-per-tick", 100 );
+	        log( "Max TNT Explosions: " + maxTntTicksPerTick );
+	    }
+
+	    public int hangingTickFrequency;
+	    private void hangingTickFrequency()
+	    {
+	        hangingTickFrequency = getInt( "hanging-tick-frequency", 100 );
+	    }
+
+	    public int tileMaxTickTime;
+	    public int entityMaxTickTime;
+	    private void maxTickTimes()
+	    {
+	        tileMaxTickTime = getInt("max-tick-time.tile", 50);
+	        entityMaxTickTime = getInt("max-tick-time.entity", 50);
+	        log("Tile Max Tick Time: " + tileMaxTickTime + "ms Entity max Tick Time: " + entityMaxTickTime + "ms");
+	    }
+	}package org.spigotmc;
+
+	import java.util.Arrays;
+	import java.util.List;
+	import org.bukkit.Bukkit;
+	import org.bukkit.configuration.file.YamlConfiguration;
+
+	public class SpigotWorldConfig
+	{
+
+	    private final String worldName;
+	    private final YamlConfiguration config;
+	    private boolean verbose;
+
+	    public SpigotWorldConfig(String worldName)
+	    {
+	        this.worldName = worldName;
+	        this.config = SpigotConfig.config;
+	        init();
+	    }
+
+	    public void init()
+	    {
+	        this.verbose = getBoolean( "verbose", true );
+
+	        log( "-------- World Settings For [" + worldName + "] --------" );
+	        SpigotConfig.readConfig( SpigotWorldConfig.class, this );
+	    }
+
+	    private void log(String s)
+	    {
+	        if ( verbose )
+	        {
+	            Bukkit.getLogger().info( s );
+	        }
+	    }
+
+	    private void set(String path, Object val)
+	    {
+	        config.set( "world-settings.default." + path, val );
+	    }
+
+	    private boolean getBoolean(String path, boolean def)
+	    {
+	        config.addDefault( "world-settings.default." + path, def );
+	        return config.getBoolean( "world-settings." + worldName + "." + path, config.getBoolean( "world-settings.default." + path ) );
+	    }
+
+	    private double getDouble(String path, double def)
+	    {
+	        config.addDefault( "world-settings.default." + path, def );
+	        return config.getDouble( "world-settings." + worldName + "." + path, config.getDouble( "world-settings.default." + path ) );
+	    }
+
+	    private int getInt(String path, int def)
+	    {
+	        config.addDefault( "world-settings.default." + path, def );
+	        return config.getInt( "world-settings." + worldName + "." + path, config.getInt( "world-settings.default." + path ) );
+	    }
+
+	    private <T> List getList(String path, T def)
+	    {
+	        config.addDefault( "world-settings.default." + path, def );
+	        return (List<T>) config.getList( "world-settings." + worldName + "." + path, config.getList( "world-settings.default." + path ) );
+	    }
+
+	    private String getString(String path, String def)
+	    {
+	        config.addDefault( "world-settings.default." + path, def );
+	        return config.getString( "world-settings." + worldName + "." + path, config.getString( "world-settings.default." + path ) );
+	    }
+
+	    public int chunksPerTick;
+	    public boolean clearChunksOnTick;
+	    private void chunksPerTick()
+	    {
+	        chunksPerTick = getInt( "chunks-per-tick", 650 );
+	        log( "Chunks to Grow per Tick: " + chunksPerTick );
+
+	        clearChunksOnTick = getBoolean( "clear-tick-list", false );
+	        log( "Clear tick list: " + clearChunksOnTick );
+	    }
+
+	    // Crop growth rates
+	    public int cactusModifier;
+	    public int caneModifier;
+	    public int melonModifier;
+	    public int mushroomModifier;
+	    public int pumpkinModifier;
+	    public int saplingModifier;
+	    public int wheatModifier;
+	    private int getAndValidateGrowth(String crop)
+	    {
+	        int modifier = getInt( "growth." + crop.toLowerCase() + "-modifier", 100 );
+	        if ( modifier == 0 )
+	        {
+	            log( "Cannot set " + crop + " growth to zero, defaulting to 100" );
+	            modifier = 100;
+	        }
+	        log( crop + " Growth Modifier: " + modifier + "%" );
+
+	        return modifier;
+	    }
+	    private void growthModifiers()
+	    {
+	        cactusModifier = getAndValidateGrowth( "Cactus" );
+	        caneModifier = getAndValidateGrowth( "Cane" );
+	        melonModifier = getAndValidateGrowth( "Melon" );
+	        mushroomModifier = getAndValidateGrowth( "Mushroom" );
+	        pumpkinModifier = getAndValidateGrowth( "Pumpkin" );
+	        saplingModifier = getAndValidateGrowth( "Sapling" );
+	        wheatModifier = getAndValidateGrowth( "Wheat" );
+	    }
+
+	    public double itemMerge;
+	    private void itemMerge()
+	    {
+	        itemMerge = getDouble("merge-radius.item", 2.5 );
+	        log( "Item Merge Radius: " + itemMerge );
+	    }
+
+	    public double expMerge;
+	    private void expMerge()
+	    {
+	        expMerge = getDouble("merge-radius.exp", 3.0 );
+	        log( "Experience Merge Radius: " + expMerge );
+	    }
+
+	    public int viewDistance;
+	    private void viewDistance()
+	    {
+	        viewDistance = getInt( "view-distance", Bukkit.getViewDistance() );
+	        log( "View Distance: " + viewDistance );
+	    }
+
+	    public byte mobSpawnRange;
+	    private void mobSpawnRange()
+	    {
+	        mobSpawnRange = (byte) getInt( "mob-spawn-range", 4 );
+	        log( "Mob Spawn Range: " + mobSpawnRange );
+	    }
+
+	    public int animalActivationRange = 32;
+	    public int monsterActivationRange = 32;
+	    public int miscActivationRange = 16;
+	    private void activationRange()
+	    {
+	        animalActivationRange = getInt( "entity-activation-range.animals", animalActivationRange );
+	        monsterActivationRange = getInt( "entity-activation-range.monsters", monsterActivationRange );
+	        miscActivationRange = getInt( "entity-activation-range.misc", miscActivationRange );
+	        log( "Entity Activation Range: An " + animalActivationRange + " / Mo " + monsterActivationRange + " / Mi " + miscActivationRange );
+	    }
+
+	    public int playerTrackingRange = 48;
+	    public int animalTrackingRange = 48;
+	    public int monsterTrackingRange = 48;
+	    public int miscTrackingRange = 32;
+	    public int otherTrackingRange = 64;
+	    private void trackingRange()
+	    {
+	        playerTrackingRange = getInt( "entity-tracking-range.players", playerTrackingRange );
+	        animalTrackingRange = getInt( "entity-tracking-range.animals", animalTrackingRange );
+	        monsterTrackingRange = getInt( "entity-tracking-range.monsters", monsterTrackingRange );
+	        miscTrackingRange = getInt( "entity-tracking-range.misc", miscTrackingRange );
+	        otherTrackingRange = getInt( "entity-tracking-range.other", otherTrackingRange );
+	        log( "Entity Tracking Range: Pl " + playerTrackingRange + " / An " + animalTrackingRange + " / Mo " + monsterTrackingRange + " / Mi " + miscTrackingRange + " / Other " + otherTrackingRange );
+	    }
+
+	    public int hopperTransfer;
+	    public int hopperCheck;
+	    public int hopperAmount;
+	    private void hoppers()
+	    {
+	        // Set the tick delay between hopper item movements
+	        hopperTransfer = getInt( "ticks-per.hopper-transfer", 8 );
+	        // Set the tick delay between checking for items after the associated
+	        // container is empty. Default to the hopperTransfer value to prevent
+	        // hopper sorting machines from becoming out of sync.
+	        hopperCheck = getInt( "ticks-per.hopper-check", hopperTransfer );
+	        hopperAmount = getInt( "hopper-amount", 1 );
+	        log( "Hopper Transfer: " + hopperTransfer + " Hopper Check: " + hopperCheck + " Hopper Amount: " + hopperAmount );
+	    }
+
+	    public boolean randomLightUpdates;
+	    private void lightUpdates()
+	    {
+	        randomLightUpdates = getBoolean( "random-light-updates", false );
+	        log( "Random Lighting Updates: " + randomLightUpdates );
+	    }
+
+	    public boolean saveStructureInfo;
+	    private void structureInfo()
+	    {
+	        saveStructureInfo = getBoolean( "save-structure-info", true );
+	        log( "Structure Info Saving: " + saveStructureInfo );
+	        if ( !saveStructureInfo )
+	        {
+	            log( "*** WARNING *** You have selected to NOT save structure info. This may cause structures such as fortresses to not spawn mobs!" );
+	            log( "*** WARNING *** Please use this option with caution, SpigotMC is not responsible for any issues this option may cause in the future!" );
+	        }
+	    }
+
+	    public int itemDespawnRate;
+	    private void itemDespawnRate()
+	    {
+	        itemDespawnRate = getInt( "item-despawn-rate", 6000 );
+	        log( "Item Despawn Rate: " + itemDespawnRate );
+	    }
+
+	    public int arrowDespawnRate;
+	    private void arrowDespawnRate()
+	    {
+	        arrowDespawnRate = getInt( "arrow-despawn-rate", 1200  );
+	        log( "Arrow Despawn Rate: " + arrowDespawnRate );
+	    }
+	    
+	    public boolean antiXray;
+	    public int engineMode;
+	    public List<Integer> hiddenBlocks;
+	    public List<Integer> replaceBlocks;
+	    public AntiXray antiXrayInstance;
+	    private void antiXray()
+	    {
+	        antiXray = getBoolean( "anti-xray.enabled", true );
+	        log( "Anti X-Ray: " + antiXray );
+
+	        engineMode = getInt( "anti-xray.engine-mode", 1 );
+	        log( "\tEngine Mode: " + engineMode );
+
+	        if ( SpigotConfig.version < 5 )
+	        {
+	            set( "anti-xray.blocks", null );
+	        }
+	        hiddenBlocks = getList( "anti-xray.hide-blocks", Arrays.asList( new Integer[]
+	        {
+	            14, 15, 16, 21, 48, 49, 54, 56, 73, 74, 82, 129, 130
+	        } ) );
+	        log( "\tHidden Blocks: " + hiddenBlocks );
+
+	        replaceBlocks = getList( "anti-xray.replace-blocks", Arrays.asList( new Integer[]
+	        {
+	            1, 5
+	        } ) );
+	        log( "\tReplace Blocks: " + replaceBlocks );
+
+	        antiXrayInstance = new AntiXray( this );
+	    }
+
+	    public boolean zombieAggressiveTowardsVillager;
+	    private void zombieAggressiveTowardsVillager()
+	    {
+	        zombieAggressiveTowardsVillager = getBoolean( "zombie-aggressive-towards-villager", true );
+	        log( "Zombie Aggressive Towards Villager: " + zombieAggressiveTowardsVillager );
+	    }
+
+	    public boolean nerfSpawnerMobs;
+	    private void nerfSpawnerMobs()
+	    {
+	        nerfSpawnerMobs = getBoolean( "nerf-spawner-mobs", false );
+	        log( "Nerfing mobs spawned from spawners: " + nerfSpawnerMobs );
+	    }
+
+	    public boolean enableZombiePigmenPortalSpawns;
+	    private void enableZombiePigmenPortalSpawns()
+	    {
+	        enableZombiePigmenPortalSpawns = getBoolean( "enable-zombie-pigmen-portal-spawns", true );
+	        log( "Allow Zombie Pigmen to spawn from portal blocks: " + enableZombiePigmenPortalSpawns );
+	    }
+
+	    public int maxBulkChunk;
+	    private void bulkChunkCount()
+	    {
+	        maxBulkChunk = getInt( "max-bulk-chunks", 10 );
+	        log( "Sending up to " + maxBulkChunk + " chunks per packet" );
+	    }
+
+	    public int maxCollisionsPerEntity;
+	    private void maxEntityCollision()
+	    {
+	        maxCollisionsPerEntity = getInt( "max-entity-collisions", 8 );
+	        log( "Max Entity Collisions: " + maxCollisionsPerEntity );
+	    }
+
+	    public int dragonDeathSoundRadius;
+	    private void keepDragonDeathPerWorld()
+	    {
+	        dragonDeathSoundRadius = getInt( "dragon-death-sound-radius", 0 );
+	    }
+
+	    public int witherSpawnSoundRadius;
+	    private void witherSpawnSoundRadius()
+	    {
+	        witherSpawnSoundRadius = getInt( "wither-spawn-sound-radius", 0 );
+	    }
+
+	    public int villageSeed;
+	    public int largeFeatureSeed;
+	    private void initWorldGenSeeds()
+	    {
+	        villageSeed = getInt( "seed-village", 10387312 );
+	        largeFeatureSeed = getInt( "seed-feature", 14357617 );
+	        log( "Custom Map Seeds:  Village: " + villageSeed + " Feature: " + largeFeatureSeed );
+	    }
+
+	    public float walkExhaustion;
+	    public float sprintExhaustion;
+	    public float combatExhaustion;
+	    public float regenExhaustion;
+	    private void initHunger()
+	    {
+	        walkExhaustion = (float) getDouble( "hunger.walk-exhaustion", 0.2 );
+	        sprintExhaustion = (float) getDouble( "hunger.sprint-exhaustion", 0.8 );
+	        combatExhaustion = (float) getDouble( "hunger.combat-exhaustion", 0.3 );
+	        regenExhaustion = (float) getDouble( "hunger.regen-exhaustion", 3 );
+	    }
+
+	    public int currentPrimedTnt = 0;
+	    public int maxTntTicksPerTick;
+	    private void maxTntPerTick() {
+	        if ( SpigotConfig.version < 7 )
+	        {
+	            set( "max-tnt-per-tick", 100 );
+	        }
+	        maxTntTicksPerTick = getInt( "max-tnt-per-tick", 100 );
+	        log( "Max TNT Explosions: " + maxTntTicksPerTick );
+	    }
+
+	    public int hangingTickFrequency;
+	    private void hangingTickFrequency()
+	    {
+	        hangingTickFrequency = getInt( "hanging-tick-frequency", 100 );
+	    }
+
+	    public int tileMaxTickTime;
+	    public int entityMaxTickTime;
+	    private void maxTickTimes()
+	    {
+	        tileMaxTickTime = getInt("max-tick-time.tile", 50);
+	        entityMaxTickTime = getInt("max-tick-time.entity", 50);
+	        log("Tile Max Tick Time: " + tileMaxTickTime + "ms Entity max Tick Time: " + entityMaxTickTime + "ms");
+	    }
+	}package org.spigotmc;
+
+	import com.google.common.base.Joiner;
+	import net.minecraft.server.MinecraftServer;
+	import com.google.common.collect.Iterables;
+	import org.bukkit.ChatColor;
+	import org.bukkit.command.Command;
+	import org.bukkit.command.CommandSender;
+
+	public class TicksPerSecondCommand extends Command
+	{
+
+	    public TicksPerSecondCommand(String name)
+	    {
+	        super( name );
+	        this.description = "Gets the current ticks per second for the server";
+	        this.usageMessage = "/tps";
+	        this.setPermission( "bukkit.command.tps" );
+	    }
+
+	    @Override
+	    public boolean execute(CommandSender sender, String currentAlias, String[] args)
+	    {
+	        if ( !testPermission( sender ) )
+	        {
+	            return true;
+	        }
+
+	        StringBuilder sb = new StringBuilder( ChatColor.GOLD + "TPS from last 1m, 5m, 15m: " );
+	        for ( double tps : MinecraftServer.getServer().recentTps )
+	        {
+	            sb.append( format( tps ) );
+	            sb.append( ", " );
+	        }
+	        sender.sendMessage( sb.substring( 0, sb.length() - 2 ) );
+
+	        return true;
+	    }
+
+	    private String format(double tps)
+	    {
+	        return ( ( tps > 18.0 ) ? ChatColor.GREEN : ( tps > 16.0 ) ? ChatColor.YELLOW : ChatColor.RED ).toString()
+	                + ( ( tps > 20.0 ) ? "*" : "" ) + Math.min( Math.round( tps * 100.0 ) / 100.0, 20.0 );
+	    }
+	}package org.spigotmc;
+
+	import net.minecraft.server.Entity;
+	import net.minecraft.server.EntityExperienceOrb;
+	import net.minecraft.server.EntityGhast;
+	import net.minecraft.server.EntityItem;
+	import net.minecraft.server.EntityItemFrame;
+	import net.minecraft.server.EntityPainting;
+	import net.minecraft.server.EntityPlayer;
+
+	public class TrackingRange
+	{
+
+	    /**
+	     * Gets the range an entity should be 'tracked' by players and visible in
+	     * the client.
+	     *
+	     * @param entity
+	     * @param defaultRange Default range defined by Mojang
+	     * @return
+	     */
+	    public static int getEntityTrackingRange(Entity entity, int defaultRange)
+	    {
+	        SpigotWorldConfig config = entity.world.spigotConfig;
+	        if ( entity instanceof EntityPlayer )
+	        {
+	            return config.playerTrackingRange;
+	        }  else if ( entity.activationType == 1 )
+	        {
+	            return config.monsterTrackingRange;
+	        } else if ( entity instanceof EntityGhast )
+	        {
+	            if ( config.monsterTrackingRange > config.monsterActivationRange )
+	            {
+	                return config.monsterTrackingRange;
+	            } else
+	            {
+	                return config.monsterActivationRange;
+	            }
+	        } else if ( entity.activationType == 2 )
+	        {
+	            return config.animalTrackingRange;
+	        } else if ( entity instanceof EntityItemFrame || entity instanceof EntityPainting || entity instanceof EntityItem || entity instanceof EntityExperienceOrb )
+	        {
+	            return config.miscTrackingRange;
+	        } else 
+	        {
+	            return config.otherTrackingRange;
+	        }
+	    }
+	}package org.spigotmc;
+
+	public class ValidateUtils
+	{
+
+	    public static String limit(String str, int limit)
+	    {
+	        if ( str.length() > limit )
+	        {
+	            return str.substring( 0, limit );
+	        }
+	        return str;
+	    }
+	}package org.spigotmc;
+
+	import java.lang.management.ManagementFactory;
+	import java.lang.management.MonitorInfo;
+	import java.lang.management.ThreadInfo;
+	import java.util.logging.Level;
+	import java.util.logging.Logger;
+	import net.minecraft.server.MinecraftServer;
+	import org.bukkit.Bukkit;
+
+	public class WatchdogThread extends Thread
+	{
+
+	    private static WatchdogThread instance;
+	    private final long timeoutTime;
+	    private final boolean restart;
+	    private volatile long lastTick;
+	    private volatile boolean stopping;
+
+	    private WatchdogThread(long timeoutTime, boolean restart)
+	    {
+	        super( "Spigot Watchdog Thread" );
+	        this.timeoutTime = timeoutTime;
+	        this.restart = restart;
+	    }
+
+	    public static void doStart(int timeoutTime, boolean restart)
+	    {
+	        if ( instance == null )
+	        {
+	            instance = new WatchdogThread( timeoutTime * 1000L, restart );
+	            instance.start();
+	        }
+	    }
+
+	    public static void tick()
+	    {
+	        instance.lastTick = System.currentTimeMillis();
+	    }
+
+	    public static void doStop()
+	    {
+	        if ( instance != null )
+	        {
+	            instance.stopping = true;
+	        }
+	    }
+
+	    @Override
+	    public void run()
+	    {
+	        while ( !stopping )
+	        {
+	            //
+	            if ( lastTick != 0 && System.currentTimeMillis() > lastTick + timeoutTime )
+	            {
+	                Logger log = Bukkit.getServer().getLogger();
+	                log.log( Level.SEVERE, "The server has stopped responding!" );
+	                log.log( Level.SEVERE, "Please report this to http://www.spigotmc.org/" );
+	                log.log( Level.SEVERE, "Be sure to include ALL relevant console errors and Minecraft crash reports" );
+	                log.log( Level.SEVERE, "Spigot version: " + Bukkit.getServer().getVersion() );
+	                //
+	                if(net.minecraft.server.World.haveWeSilencedAPhysicsCrash)
+	                {
+	                    log.log( Level.SEVERE, "------------------------------" );
+	                    log.log( Level.SEVERE, "During the run of the server, a physics stackoverflow was supressed" );
+	                    log.log( Level.SEVERE, "near " + net.minecraft.server.World.blockLocation);
+	                }
+	                //
+	                log.log( Level.SEVERE, "------------------------------" );
+	                log.log( Level.SEVERE, "Server thread dump (Look for plugins here before reporting to Spigot!):" );
+	                dumpThread( ManagementFactory.getThreadMXBean().getThreadInfo( MinecraftServer.getServer().primaryThread.getId(), Integer.MAX_VALUE ), log );
+	                log.log( Level.SEVERE, "------------------------------" );
+	                //
+	                log.log( Level.SEVERE, "Entire Thread Dump:" );
+	                ThreadInfo[] threads = ManagementFactory.getThreadMXBean().dumpAllThreads( true, true );
+	                for ( ThreadInfo thread : threads )
+	                {
+	                    dumpThread( thread, log );
+	                }
+	                log.log( Level.SEVERE, "------------------------------" );
+
+	                if ( restart )
+	                {
+	                    RestartCommand.restart();
+	                }
+	                break;
+	            }
+
+	            try
+	            {
+	                sleep( 10000 );
+	            } catch ( InterruptedException ex )
+	            {
+	                interrupt();
+	            }
+	        }
+	    }
+
+	    private static void dumpThread(ThreadInfo thread, Logger log)
+	    {
+	        log.log( Level.SEVERE, "------------------------------" );
+	        //
+	        log.log( Level.SEVERE, "Current Thread: " + thread.getThreadName() );
+	        log.log( Level.SEVERE, "\tPID: " + thread.getThreadId()
+	                + " | Suspended: " + thread.isSuspended()
+	                + " | Native: " + thread.isInNative()
+	                + " | State: " + thread.getThreadState() );
+	        if ( thread.getLockedMonitors().length != 0 )
+	        {
+	            log.log( Level.SEVERE, "\tThread is waiting on monitor(s):" );
+	            for ( MonitorInfo monitor : thread.getLockedMonitors() )
+	            {
+	                log.log( Level.SEVERE, "\t\tLocked on:" + monitor.getLockedStackFrame() );
+	            }
+	        }
+	        log.log( Level.SEVERE, "\tStack:" );
+	        //
+	        for ( StackTraceElement stack : thread.getStackTrace() )
+	        {
+	            log.log( Level.SEVERE, "\t\t" + stack );
+	        }
+	    }Copyright  2018-2020. Finn steenhuyse reserved.
+	    *
+	    * Redistribution and use in source and binary forms, with or without modification, are
+	    * permitted provided that the following conditions are met:
+	    *
+	    *    1. Redistributions of source code must retain the above copyright notice, this list of
+	    *       conditions and the following disclaimer.
+	    *
+	    *    2. Redistributions in binary form must reproduce the above copyright notice, this list
+	    *       of conditions and the following disclaimer in the documentation and/or other materials
+	    *       provided with the distribution.
+	    *
+	    * THIS SOFTWARE IS PROVIDED BY THE AUTHOR ''AS IS'' AND ANY EXPRESS OR IMPLIED
+	    * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+	    * FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE AUTHOR OR
+	    * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+	    * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+	    * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+	    * ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+	    * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+	    * ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+	    *
+	    * The views and conclusions contained in the software and documentation are those of the
+	    * authors and contributors and should not be interpreted as representing official policies,
+	    * either expressed or implied, of anybody else
