@@ -1,0 +1,50 @@
+    }
+
+		    /**
+		     * Removes all non exposed ores from the chunk buffer.
+		     */
+		    public void obfuscate(int chunkX, int chunkY, int bitmask, byte[] buffer, World world)
+		    {
+		        // If the world is marked as obfuscated
+		        if ( world.spigotConfig.antiXray )
+		        {
+		            // Initial radius to search around for air
+		            int initialRadius = 1;
+		            // Which block in the buffer we are looking at, anywhere from 0 to 16^4
+		            int index = 0;
+		            // The iterator marking which random ore we should use next
+		            int randomOre = 0;
+
+		            // Chunk corner X and Z blocks
+		            int startX = chunkX << 4;
+		            int startZ = chunkY << 4;
+
+		            byte replaceWithTypeId;
+		            switch ( world.getWorld().getEnvironment() )
+		            {
+		                case NETHER:
+		                    replaceWithTypeId = (byte) CraftMagicNumbers.getId(Blocks.NETHERRACK);
+		                    break;
+		                case THE_END:
+		                    replaceWithTypeId = (byte) CraftMagicNumbers.getId(Blocks.END_STONE);
+		                    break;
+		                default:
+		                    replaceWithTypeId = (byte) CraftMagicNumbers.getId(Blocks.STONE);
+		                    break;
+		            }
+
+		            // Chunks can have up to 16 sections
+		            for ( int i = 0; i < 16; i++ )
+		            {
+		                // If the bitmask indicates this chunk is sent...
+		                if ( ( bitmask & 1 << i ) != 0 )
+		                {
+		                    // Work through all blocks in the chunk, y,z,x
+		                    for ( int y = 0; y < 16; y++ )
+		                    {
+		                        for ( int z = 0; z < 16; z++ )
+		                        {
+		                            for ( int x = 0; x < 16; x++ )
+		                            {
+		                                // For some reason we can get too far ahead of ourselves (concurrent modification on bulk chunks?) so if we do, just abort and move on
+		                                if ( index >= buffer.length )
