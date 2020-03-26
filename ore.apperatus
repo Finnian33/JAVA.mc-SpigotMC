@@ -1,0 +1,21 @@
+           // Add it to the set of replacement blocks
+		                blocks.add( (byte) (int) i );
+		            }
+		        }
+		        // Bake it to a flat array of replacements
+		        replacementOres = blocks.toArray();
+		    }
+
+		    /**
+		     * Starts the timings handler, then updates all blocks within the set radius
+		     * of the given coordinate, revealing them if they are hidden ores.
+		     */
+		    public void updateNearbyBlocks(World world, BlockPosition position)
+		    {
+		        if ( world.spigotConfig.antiXray )
+		        {
+		            update.startTiming();
+		            updateNearbyBlocks( world, position, 2, false ); // 2 is the radius, we shouldn't change it as that would make it exponentially slower
+		            update.stopTiming();
+		        }
+		    }
